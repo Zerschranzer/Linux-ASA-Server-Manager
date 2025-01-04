@@ -1,6 +1,11 @@
 # ARK: Survival Ascended Linux Server Manager
 
-This repository provides a set of scripts—primarily **`ark_instance_manager.sh`**—for installing and managing **ARK: Survival Ascended** (ASA) servers on Linux. Since there is **no official Linux server** for ASA, these scripts leverage **Proton** (plus other utilities) to run the Windows server executable on Linux. The solution does *not* require Docker and includes features for multi-instance management, backups, automated restarts, and more.
+This repository provides a set of scripts—primarily **`ark_instance_manager.sh`** and **`ark_docker_manager.sh`**—for installing and managing **ARK: Survival Ascended** (ASA) servers on Linux. Since there is **no official Linux server** for ASA, these scripts leverage **Proton** (plus other utilities) to run the Windows server executable on Linux. The solution does *not* require Docker and includes features for multi-instance management, backups, automated restarts, and more.
+
+> **Note**: There is **also a Docker-based script**, **`ark_docker_manager.sh`**, which containerizes the entire setup if you prefer Docker. This script uses Docker containers to run the server instances, with the **server files and configurations mounted as Docker volumes**. This approach ensures that the server data remains accessible and separate from the containerized runtime environment while leveraging Docker for process isolation and dependency management.  
+The **usage** of both scripts is nearly **identical**—commands, instance creation, backups, and restarts work the same way. With the Docker-based script, the server binaries and save data are shared through volumes, allowing the same file structure as the non-Docker setup. For simplicity, this README focuses on **`ark_instance_manager.sh`**; if you choose the Docker route, simply run **`ark_docker_manager.sh`** instead and follow the same steps.  
+
+If you prefer the flexibility and modularity of Docker, the **`ark_docker_manager.sh`** script makes it easy to containerize your server setup without changing the workflow or configuration methods.
 
 ---
 
@@ -28,8 +33,8 @@ This repository provides a set of scripts—primarily **`ark_instance_manager.sh
 
 ## 1. Key Features
 
-- **No Docker Required** – Runs the Windows ASA server on Linux via Proton.  
-- **Automatic Dependency Checking** – Installs or warns about missing libraries (e.g., 32-bit libs, Python).  
+- **No Docker Required** – Runs the Windows ASA server on Linux via Proton. (Or use the Docker script if you prefer!)  
+- **Automatic Dependency Checking** – Installs or warns about missing libraries (e.g., 32-bit libs, Python). (only for non Docker version)
 - **Multi-Instance Management** – Configure and run multiple servers on one machine.  
 - **Interactive Menu** – User-friendly text-based UI for setup, instance creation, and day-to-day tasks.  
 - **Command-Line Interface** – Ideal for automation (cron jobs, scripts) or remote management.  
@@ -67,6 +72,7 @@ This repository provides a set of scripts—primarily **`ark_instance_manager.sh
    ```bash
    chmod +x ark_instance_manager.sh ark_restart_manager.sh rcon.py
    ```
+   *(If using Docker, also `chmod +x ark_docker_manager.sh`.)*
 
 3. **Run `ark_instance_manager.sh` (no arguments)**:
    ```bash
@@ -81,6 +87,8 @@ This repository provides a set of scripts—primarily **`ark_instance_manager.sh
    ./ark_instance_manager.sh setup
    ```
    - This adds `asa-manager` to `~/.local/bin` (if on your PATH), so you can type `asa-manager` globally.
+
+> If you prefer Docker, the above steps also apply to **`ark_docker_manager.sh`**. Just pick **"Create ARK base image"** from the menu instead of **"Install/Update Base Server"**.
 
 ![Installing or Updating the Base Server](https://raw.githubusercontent.com/Zerschranzer/Linux-ASA-Server-Manager/refs/heads/main/docs/images/Installing%E2%81%84Updating_Baseserver.png)
 
@@ -99,6 +107,8 @@ Running **`./ark_instance_manager.sh`** with **no arguments** enters a menu-base
 ...
 ```
 Use the numbered options to install the server, create/edit instances, start/stop servers, manage backups, etc.
+
+*(With Docker: `./ark_docker_manager.sh` provides a nearly identical menu.)*
 
 ### 4.2 Command-Line Usage
 
@@ -127,6 +137,8 @@ For quick tasks or automation, pass arguments directly:
 ./ark_instance_manager.sh <instance_name> send_rcon "<RCON command>"
 ./ark_instance_manager.sh <instance_name> backup <world_folder>
 ```
+*(In Docker mode, replace `ark_instance_manager.sh` with `ark_docker_manager.sh`.)*
+
 Use these for scripts (like cron) or when you know exactly what action is needed.
 
 ---
@@ -242,7 +254,8 @@ Or send a single command:
 ./rcon.py 127.0.0.1:27020 -p "MyRconPassword" -c "SaveWorld"
 ```
 
-**`ark_instance_manager.sh`** uses `rcon.py` for graceful shutdown and interactive RCON access from the menu.
+**`ark_instance_manager.sh`** uses `rcon.py` for graceful shutdown and interactive RCON access from the menu.  
+*(Again, this applies equally to **`ark_docker_manager.sh`**.)*
 
 ![RCON Console Example](https://raw.githubusercontent.com/Zerschranzer/Linux-ASA-Server-Manager/refs/heads/main/docs/images/RCON_Example.png)
 
@@ -250,7 +263,7 @@ Or send a single command:
 
 ## 9. Troubleshooting
 
-- **Check Logs**: `instances/<instance_name>/server.log` for server errors.  
+- **Check Logs**: `instances/<instance_name>/server.log` for server errors. In Docker mode, you can also check with `docker logs ark_<instance_name>`.  
 - **Dependencies**: If missing, the script instructs how to install them for your distro.  
 - **Unique Ports**: Ensure each instance uses different ports, and open them in your firewall if needed.  
 - **Naming Collisions**: Distinct instance names prevent accidentally stopping the wrong server.  
@@ -261,7 +274,8 @@ Or send a single command:
 ## 10. Credits
 
 - [SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD) for server file updates.  
-- [Proton GE Custom](https://github.com/GloriousEggroll/proton-ge-custom) for running Windows apps on Linux.
+- [Proton GE Custom](https://github.com/GloriousEggroll/proton-ge-custom) for running Windows apps on Linux.  
+- **Docker** (for `ark_docker_manager.sh`) if you choose the containerized approach.
 
 ---
 
@@ -272,4 +286,4 @@ This project is licensed under the [MIT License](LICENSE). Feel free to modify a
 ---
 
 **Enjoy managing your Ark Survival Ascended server(s) on Linux!**  
-If you run into any issues or have suggestions, please open an issue or pull request on GitHub.
+If you run into any issues or have suggestions, please open an issue or pull request on GitHub. The same usage applies to **`ark_docker_manager.sh`** if you prefer to run everything in containers.
