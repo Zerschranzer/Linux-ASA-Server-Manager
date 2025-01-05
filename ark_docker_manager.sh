@@ -627,6 +627,8 @@ delete_instance() {
             # Delete the instance directory
             echo -e "${CYAN}Deleting instance directory for '$instance'...${RESET}"
             rm -rf "$INSTANCES_DIR/$instance" || echo -e "${RED}Failed to delete instance directory.${RESET}"
+            rm -rf "$BINARIES_DIR/ShooterGame/Saved/$instance" || true
+            rm -rf "$BINARIES_DIR/ShooterGame/Saved/SavedArks/$instance" || true
 
             echo -e "${GREEN}Instance '$instance' has been deleted.${RESET}"
         elif [[ $response == "cancel" ]]; then
