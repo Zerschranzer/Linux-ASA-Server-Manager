@@ -420,9 +420,9 @@ start_server() {
     docker run -d \
          --env UMASK=0007 \
         --name "$container_name" \
-        -p "${GAME_PORT}:${GAME_PORT}" \
-        -p "${QUERY_PORT}:${QUERY_PORT}" \
-        -p "${RCON_PORT}:${RCON_PORT}" \
+        -p "${GAME_PORT}:${GAME_PORT}/udp" \
+        -p "${QUERY_PORT}:${QUERY_PORT}/udp" \
+        -p "${RCON_PORT}:${RCON_PORT}/tcp" \
         -v "$BINARIES_DIR:/ark/binaries" \
         -v "$inst_dir:/ark/instance" \
         -v "$config_dir/Game.ini:/ark/binaries/ShooterGame/Saved/Config/WindowsServer/Game.ini:rw" \
@@ -446,21 +446,6 @@ start_server() {
         echo -e "${RED}Failed to start the server for instance: $instance.${RESET}"
         return 1
     fi
-}
-
-# Function to stop the server
-stop_server() {
-    local instance="$1"
-
-    if ! is_server_running "ark_$instance"; then
-        echo -e "${YELLOW}Server for instance $instance is not running.${RESET}"
-        return 0
-    fi
-
-    echo -e "${GREEN}Stopping instance '$instance' ...${RESET}"
-    send_rcon_command ${instance} "SaveWorld"
-    docker stop "ark_${instance}" 2>/dev/null || true
-    docker rm "ark_${instance}" 2>/dev/null || true
 }
 
 # Function to start RCON CLI
