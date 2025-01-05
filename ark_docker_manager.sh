@@ -448,6 +448,21 @@ start_server() {
     fi
 }
 
+# Function to stop the server
+stop_server() {
+    local instance="$1"
+
+    if ! is_server_running "ark_$instance"; then
+        echo -e "${YELLOW}Server for instance $instance is not running.${RESET}"
+        return 0
+    fi
+
+    echo -e "${GREEN}Stopping instance '$instance' ...${RESET}"
+    send_rcon_command ${instance} "SaveWorld"
+    docker stop "ark_${instance}" 2>/dev/null || true
+    docker rm "ark_${instance}" 2>/dev/null || true
+}
+
 # Function to start RCON CLI
 start_rcon_cli() {
     local instance=$1
