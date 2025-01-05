@@ -36,13 +36,40 @@ check_executables() {
     done
 }
 
-# Function to check docker
+# Check if Docker works properly for the script
 check_docker() {
-    if ! command -v docker &> /dev/null; then
+    # Check if Docker is installed
+    if ! command -v docker &>/dev/null; then
         echo -e "${RED}Error: Docker is not installed or not in PATH.${RESET}"
+        echo -e "${YELLOW}Please install Docker using your package manager.${RESET}"
         exit 1
     fi
+
+    # Check if the Docker daemon is running
+    if ! systemctl is-active --quiet docker; then
+        echo -e "${RED}Error: Docker daemon is not running.${RESET}"
+        echo -e "${YELLOW}Start it with:${RESET} ${GREEN}sudo systemctl start docker${RESET}"
+        echo -e "${YELLOW}Or enable and start it with:${RESET} ${GREEN}sudo systemctl enable --now docker${RESET}"
+        exit 1
+    fi
+
+    # Check if the user has access to Docker
+    if ! docker info &>/dev/null; then
+        if id -nG "$USER" | grep -qw docker; then
+            echo -e "${RED}You are in the 'docker' group, but your session does not reflect the updated group membership.${RESET}"
+            echo -e "${YELLOW}Run:${RESET} ${GREEN}newgrp docker${RESET} ${YELLOW}or log out and back in.${RESET}"
+        else
+            echo -e "${RED}Your user is not in the 'docker' group.${RESET}"
+            echo -e "${YELLOW}Add your user to the 'docker' group with:${RESET}"
+            echo -e "${GREEN}sudo usermod -aG docker $USER${RESET}"
+            echo -e "${YELLOW}Then log out and back in, or run:${RESET} ${GREEN}newgrp docker${RESET}"
+        fi
+        exit 1
+    fi
+
+    echo -e "${GREEN}Docker is installed, running, and accessible.${RESET}"
 }
+
 # Call the functions at the start of the script
 check_executables
 check_docker
