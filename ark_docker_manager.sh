@@ -1204,7 +1204,7 @@ main_menu() {
                     configure_companion_script
                     break
                     ;;
-                x)
+                14)
                     echo -e "${GREEN}Exiting ARK Server Manager. Goodbye!${RESET}"
                     exit 0
                     ;;
@@ -1277,7 +1277,7 @@ manage_instance() {
                     instance=$new_instance_name  # Update the instance variable
                     break
                     ;;
-                x)
+                10)
                     return
                     ;;
                 *)
