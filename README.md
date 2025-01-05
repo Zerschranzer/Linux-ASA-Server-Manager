@@ -1,4 +1,4 @@
-# ARK: Survival Ascended Linux Server Manager
+# ARK: Survival Ascended Linux Server Manager – Docker & Non-Docker
 
 This repository provides a set of scripts—primarily **`ark_instance_manager.sh`** and **`ark_docker_manager.sh`**—for installing and managing **ARK: Survival Ascended** (ASA) servers on Linux. Since there is **no official Linux server** for ASA, these scripts leverage **Proton** (plus other utilities) to run the Windows server executable on Linux. The solution does *not* require Docker and includes features for multi-instance management, backups, automated restarts, and more.
 
