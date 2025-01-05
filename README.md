@@ -286,4 +286,4 @@ This project is licensed under the [MIT License](LICENSE). Feel free to modify a
 ---
 
 **Enjoy managing your Ark Survival Ascended server(s) on Linux!**  
-If you run into any issues or have suggestions, please open an issue or pull request on GitHub. The same usage applies to **`ark_docker_manager.sh`** if you prefer to run everything in containers.
+If you run into any issues or have suggestions, please open an issue or pull request on GitHub.
