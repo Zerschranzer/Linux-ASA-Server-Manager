@@ -28,7 +28,7 @@ ARK_INSTANCE_MANAGER="$BASE_DIR/ark_instance_manager.sh"
 # Define the base paths as variables
 STEAMCMD_DIR="$BASE_DIR/steamcmd"
 SERVER_FILES_DIR="$BASE_DIR/server-files"
-PROTON_VERSION="GE-Proton9-21"
+PROTON_VERSION="GE-Proton10-4"
 PROTON_DIR="$BASE_DIR/$PROTON_VERSION"
 
 # Define URLs for SteamCMD and Proton.
@@ -646,7 +646,7 @@ stop_server() {
         echo -e "${GREEN}Server instance $instance reported 'Exiting...'. Awaiting shutdown...${RESET}"
 
         # Check in a loop if the process is still running
-        local timeout=30  # Give 30 seconds
+        local timeout=120  # Give 120 seconds
         local waited=0
 
         while pgrep -f "ArkAscendedServer.exe.*AltSaveDirectoryName=$SAVE_DIR" > /dev/null; do
