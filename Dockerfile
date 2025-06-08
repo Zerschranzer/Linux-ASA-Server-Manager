@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # SteamCMD/Proton directories
 ENV STEAMCMDDIR="/opt/steamcmd"
-ENV PROTON_VERSION="GE-Proton9-22"
+ENV PROTON_VERSION="GE-Proton10-4"
 ENV PROTONDIR="/opt/proton/${PROTON_VERSION}"
 
 # Add SteamCMD to PATH
