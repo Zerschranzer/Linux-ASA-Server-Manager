@@ -420,7 +420,8 @@ start_server() {
     # Adding a trailing space to the ServerName to avoid conflicts if the ServerName is identical to the instance name.
     # This ensures the server processes the name correctly, even though the space is invisible to users.
     docker run -d \
-         --env UMASK=0007 \
+        --user $(id -u):$(id -g) \
+        --env UMASK=0007 \
         --name "$container_name" \
         -p "${GAME_PORT}:${GAME_PORT}/udp" \
         -p "${QUERY_PORT}:${QUERY_PORT}/udp" \
