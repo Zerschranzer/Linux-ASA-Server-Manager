@@ -643,7 +643,7 @@ stop_server() {
 
     # Check if the response matches "Exiting..."
     if [[ "$response" == "Exiting..." ]]; then
-        echo -e "${GREEN}Server instance $instance reported 'Exiting...'. Awaiting shutdown...${RESET}"
+        echo -e "${GREEN}Server instance $instance reported 'Exiting...'. Awaiting shutdown...(That can take up to 2 minutes.)${RESET}"
 
         # Check in a loop if the process is still running
         local timeout=120  # Give 120 seconds
