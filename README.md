@@ -260,14 +260,43 @@ Or send a single command:
 ![RCON Console Example](https://raw.githubusercontent.com/Zerschranzer/Linux-ASA-Server-Manager/refs/heads/main/docs/images/RCON_Example.png)
 
 ---
-
 ## 9. Troubleshooting
 
-- **Check Logs**: `instances/<instance_name>/server.log` for server errors. In Docker mode, you can also check with `docker logs ark_<instance_name>`.  
-- **Dependencies**: If missing, the script instructs how to install them for your distro.  
-- **Unique Ports**: Ensure each instance uses different ports, and open them in your firewall if needed.  
-- **Naming Collisions**: Distinct instance names prevent accidentally stopping the wrong server.  
-- **System Resources**: ASA is resource-heavy; watch CPU/RAM usage, especially with multiple instances.  
+* **Check Logs**:
+  Check `instances/<instance_name>/server.log` or:
+
+  ```
+  <yourasaserver>/server-files/ShooterGame/Saved/Logs/
+  ```
+
+  The main file is `ShooterGame.log`, newer logs are numbered (`ShooterGame1.log`, `ShooterGame2.log`, etc.).
+  In Docker mode, you can also check logs with:
+
+  ```
+  docker logs ark_<instance_name>
+  ```
+
+* **Dependencies**:
+  If missing, the script will tell you how to install them for your distro.
+
+* **Unique Ports**:
+  Each instance must use different ports. Make sure those ports are open in your firewall.
+
+* **Naming Collisions**:
+  Use distinct instance names to avoid conflicts when starting or stopping servers.
+
+* **System Resources**:
+  ASA needs a lot of RAM and CPU. Keep an eye on usage, especially when running multiple instances.
+
+* **Running inside a virtual machine?**
+  Make sure the VM's CPU type is set to `host`. The server needs **SSE4.2** support, which the default `kvm64` CPU does not provide.
+  If this feature is missing, you may see a log message like:
+
+  ```
+  This CPU does not support a required feature (SSE4.2)
+  ```
+
+  **Fix**: Change the VM's CPU type to `host`.
 
 ---
 
