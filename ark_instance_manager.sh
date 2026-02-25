@@ -1307,15 +1307,26 @@ $messages_str)
         local cron_hour=$(echo "$cron_time" | cut -d':' -f1)
         local cron_min=$(echo "$cron_time" | cut -d':' -f2)
 
-        # 1) Read the current crontab (if any),
-        # 2) Remove all lines referencing our manager script,
-        # 3) Append a new line with the chosen schedule,
-        # 4) Save back to crontab
-        ( crontab -l 2>/dev/null | grep -v "$companion_script"
-        echo "$cron_min $cron_hour * * * $companion_script"
-        ) | crontab -
+        # Robust crontab update using a temporary file
+        local tmp_cron
+        tmp_cron=$(mktemp)
 
-        echo -e "${GREEN}Cron job scheduled daily at $cron_time.${RESET}"
+        # Export current crontab (ignoring old entries of this script)
+        # Use '|| true' to prevent script exit if crontab is currently empty
+        crontab -l 2>/dev/null | grep -v "$companion_script" > "$tmp_cron" || true
+
+        # Append the new schedule
+        echo "$cron_min $cron_hour * * * $companion_script" >> "$tmp_cron"
+
+        # Re-install the updated crontab
+        if crontab "$tmp_cron"; then
+            echo -e "${GREEN}Cron job successfully scheduled for $cron_time daily.${RESET}"
+        else
+            echo -e "${RED}Error: Failed to install crontab.${RESET}"
+        fi
+
+        # Clean up temporary file
+        rm -f "$tmp_cron"
     fi
 }
 
