@@ -15,8 +15,12 @@ MAGENTA='\e[35m'
 CYAN='\e[36m'
 RESET='\e[0m'
 
-# Signal handling to inform the user and kill processes
-trap 'echo -e "${RED}Script interrupted. Servers that have already started will continue running.${RESET}"; pkill -P $$; exit 1' SIGINT SIGTERM
+# Signal handling. When the user hits Ctrl-C or the script gets SIGTERM, we
+# want already-started servers to keep running -- they are intentionally
+# detached via setsid in start_server() and live in their own process group.
+# We deliberately do NOT pkill children here: doing so used to kill the servers
+# the message claims will keep running, leaving the user with a tidy lie.
+trap 'echo -e "${RED}Script interrupted. Detached servers continue running in the background.${RESET}"; exit 130' SIGINT SIGTERM
 
 # Base directory for all instances
 BASE_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
@@ -28,12 +32,25 @@ ARK_INSTANCE_MANAGER="$BASE_DIR/ark_instance_manager.sh"
 # Define the base paths as variables
 STEAMCMD_DIR="$BASE_DIR/steamcmd"
 SERVER_FILES_DIR="$BASE_DIR/server-files"
-PROTON_VERSION="GE-Proton10-4"
-PROTON_DIR="$BASE_DIR/$PROTON_VERSION"
 
-# Define URLs for SteamCMD and Proton.
+# umu-launcher configuration -- replaces direct proton invocation.
+# umu-run handles Steam Linux Runtime, Proton prefix setup and protonfixes
+# automatically. No Steam install required.
+#
+# The zipapp is a self-contained Python archive (PEP 441), distribution-agnostic.
+# It is downloaded standalone into $BASE_DIR/umu-launcher (same pattern as the old
+# Proton tarball download), so the script does not depend on any distro package
+# for umu-launcher itself. Only python3 >= 3.10 is required on the host.
+UMU_VERSION="1.4.0"
+UMU_DIR="$BASE_DIR/umu-launcher"
+UMU_RUN_BIN="$UMU_DIR/umu-run"
+UMU_URL="https://github.com/Open-Wine-Components/umu-launcher/releases/download/$UMU_VERSION/umu-launcher-$UMU_VERSION-zipapp.tar"
+UMU_PROTONPATH="${UMU_PROTONPATH:-GE-Proton}"
+UMU_GAMEID="${UMU_GAMEID:-umu-default}"
+UMU_PREFIX_DIR="$BASE_DIR/umu-prefix"
+
+# Define URL for SteamCMD.
 STEAMCMD_URL="https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
-PROTON_URL="https://github.com/GloriousEggroll/proton-ge-custom/releases/download/$PROTON_VERSION/$PROTON_VERSION.tar.gz"
 
 check_dependencies() {
     local missing=()
@@ -42,18 +59,27 @@ check_dependencies() {
     local config_file="$BASE_DIR/.ark_server_manager_config"
 
     # Detect the package manager
+    # umu-launcher zipapp is shipped self-contained; we no longer need 32-bit libs
+    # (libc6:i386, libstdc++6:i386, libncursesw6:i386, libfreetype6:i386, etc).
+    # umu brings the Steam Linux Runtime which provides everything Proton needs.
+    # Required at the host level:
+    #   - wget/tar : download umu-launcher zipapp + steamcmd + GE-Proton
+    #   - python3 (>= 3.10) : run the umu-launcher zipapp
+    #   - libzstd1/libzstd.so.1 : umu uses pyzstd which links against system libzstd
+    #   - pkill (procps) : process management
+    #   - cron : scheduled restarts
     if command -v apt-get >/dev/null 2>&1; then
         package_manager="apt-get"
-        dependencies=("wget" "tar" "grep" "libc6:i386" "libstdc++6:i386" "libncursesw6:i386" "python3" "libfreetype6:i386" "libfreetype6:amd64" "pkill" "cron")
+        dependencies=("wget" "tar" "grep" "python3" "libzstd1" "pkill" "cron")
     elif command -v zypper >/dev/null 2>&1; then
         package_manager="zypper"
-        dependencies=("wget" "tar" "grep" "libX11-6-32bit" "libX11-devel-32bit" "gcc-32bit" "libexpat1-32bit" "libXext6-32bit" "python3" "pkill" "libfreetype6" "libfreetype6-32bit" "cron")
+        dependencies=("wget" "tar" "grep" "python3" "libzstd1" "pkill" "cron")
     elif command -v dnf >/dev/null 2>&1; then
         package_manager="dnf"
-        dependencies=("wget" "tar" "grep" "glibc-devel.i686" "ncurses-devel.i686" "libstdc++-devel.i686" "python3" "freetype" "procps-ng" "cronie")
+        dependencies=("wget" "tar" "grep" "python3" "libzstd" "procps-ng" "cronie")
     elif command -v pacman >/dev/null 2>&1; then
         package_manager="pacman"
-        dependencies=("wget" "tar" "grep" "lib32-libx11" "gcc-multilib" "lib32-expat" "lib32-libxext" "python" "freetype2" "cronie")
+        dependencies=("wget" "tar" "grep" "python" "zstd" "cronie")
     else
         echo -e "${RED}Error: No supported package manager found on this system.${RESET}"
         exit 1
@@ -61,15 +87,22 @@ check_dependencies() {
 
     # Check for missing dependencies
     for cmd in "${dependencies[@]}"; do
-        if [ "$package_manager" == "apt-get" ] && [[ "$cmd" == *:i386* || "$cmd" == *:amd64* ]]; then
-            if ! dpkg-query -W -f='${Status}' "$cmd" 2>/dev/null | grep -q "install ok installed"; then
-                missing+=("$cmd")
+        if [ "$package_manager" == "apt-get" ]; then
+            # Library packages -- check with dpkg, since they don't expose a command
+            if [[ "$cmd" == lib* ]]; then
+                if ! dpkg-query -W -f='${Status}' "$cmd" 2>/dev/null | grep -q "install ok installed"; then
+                    missing+=("$cmd")
+                fi
+            elif [ "$cmd" == "pkill" ]; then
+                if ! command -v pkill >/dev/null 2>&1; then
+                    missing+=("procps")
+                fi
+            else
+                if ! command -v "${cmd}" >/dev/null 2>&1; then
+                    missing+=("$cmd")
+                fi
             fi
-        elif [ "$package_manager" == "zypper" ]; then
-            if ! rpm -q "${cmd}" >/dev/null 2>&1 && ! command -v "${cmd}" >/dev/null 2>&1; then
-                missing+=("$cmd")
-            fi
-        elif [ "$package_manager" == "dnf" ]; then
+        elif [ "$package_manager" == "zypper" ] || [ "$package_manager" == "dnf" ]; then
             if ! rpm -q "${cmd}" >/dev/null 2>&1 && ! command -v "${cmd}" >/dev/null 2>&1; then
                 missing+=("$cmd")
             fi
@@ -87,6 +120,21 @@ check_dependencies() {
             fi
         fi
     done
+
+    # Verify python3 is >= 3.10 (required by umu-launcher zipapp).
+    # We check this only if python3 itself is present -- otherwise it'll already
+    # be in the missing list above.
+    if command -v python3 >/dev/null 2>&1; then
+        local py_ok
+        py_ok=$(python3 -c 'import sys; print("ok" if sys.version_info >= (3, 10) else "old")' 2>/dev/null)
+        if [ "$py_ok" != "ok" ]; then
+            local py_ver
+            py_ver=$(python3 --version 2>&1)
+            echo -e "${RED}Error: umu-launcher requires Python >= 3.10, but found: $py_ver${RESET}"
+            echo -e "${YELLOW}Please update Python on your system. On older distros you may need a backports repo.${RESET}"
+            exit 1
+        fi
+    fi
 
     # Report missing dependencies and ask to continue
     if [ ${#missing[@]} -ne 0 ]; then
@@ -307,7 +355,7 @@ install_base_server() {
     echo -e "${CYAN}Installing/updating base server...${RESET}"
 
     # Create necessary directories
-    mkdir -p "$STEAMCMD_DIR" "$PROTON_DIR" "$SERVER_FILES_DIR"
+    mkdir -p "$STEAMCMD_DIR" "$SERVER_FILES_DIR" "$UMU_DIR" "$UMU_PREFIX_DIR"
 
     # Download and unpack SteamCMD if not already installed
     if [ ! -f "$STEAMCMD_DIR/steamcmd.sh" ]; then
@@ -319,46 +367,183 @@ install_base_server() {
         echo -e "${GREEN}SteamCMD already installed.${RESET}"
     fi
 
-    # Download and unpack Proton if not already installed
-    if [ ! -d "$PROTON_DIR/files" ]; then
-        echo -e "${CYAN}Downloading Proton...${RESET}"
-        wget -q -O "$PROTON_DIR/$PROTON_VERSION.tar.gz" "$PROTON_URL"
-        tar -xzf "$PROTON_DIR/$PROTON_VERSION.tar.gz" -C "$PROTON_DIR" --strip-components=1
-        rm "$PROTON_DIR/$PROTON_VERSION.tar.gz"
+    # Download and unpack umu-launcher zipapp if not already installed.
+    # The zipapp is a single self-contained Python archive that works on any
+    # distribution with python3 >= 3.10 -- no distro packages needed.
+    # umu-launcher itself downloads and manages the Steam Linux Runtime and
+    # GE-Proton on first run (when PROTONPATH=GE-Proton is set).
+    if [ ! -x "$UMU_RUN_BIN" ]; then
+        echo -e "${CYAN}Downloading umu-launcher zipapp ($UMU_VERSION)...${RESET}"
+        mkdir -p "$UMU_DIR"
+        local umu_tar="$UMU_DIR/umu-launcher-$UMU_VERSION-zipapp.tar"
+        wget -q -O "$umu_tar" "$UMU_URL"
+        # The tar contains an `umu/` directory; we extract its contents into UMU_DIR.
+        tar -xf "$umu_tar" -C "$UMU_DIR" --strip-components=1
+        rm "$umu_tar"
+        chmod +x "$UMU_RUN_BIN"
+        echo -e "${GREEN}umu-launcher installed at $UMU_DIR.${RESET}"
     else
-        echo -e "${GREEN}Proton already installed.${RESET}"
+        echo -e "${GREEN}umu-launcher already installed.${RESET}"
+    fi
+
+    # Pre-fetch the Steam Linux Runtime (sniper, ~300 MB) and GE-Proton (~500 MB)
+    # via a dummy umu-run invocation. Without this, the first real server start
+    # would block on these downloads -- which can take 5-15 minutes on slow
+    # connections and would race with the initial-config-generation logic below.
+    # Running `--help` triggers the runtime/proton fetch without launching anything.
+    if [ ! -d "$HOME/.local/share/umu/steamrt3" ] || \
+       [ ! "$(ls -A "$HOME/.local/share/umu/steamrt3" 2>/dev/null)" ]; then
+        echo -e "${CYAN}First-time umu setup: downloading Steam Linux Runtime + GE-Proton (~800 MB, may take several minutes)...${RESET}"
+        echo -e "${YELLOW}You will see download progress messages from umu below.${RESET}"
+        WINEPREFIX="$UMU_PREFIX_DIR" \
+        GAMEID="$UMU_GAMEID" \
+        PROTONPATH="$UMU_PROTONPATH" \
+            "$UMU_RUN_BIN" --help >/dev/null || true
+        echo -e "${GREEN}umu runtime ready.${RESET}"
+    fi
+
+    # Warm up the Wine prefix synchronously. Wine's first-time prefix init runs
+    # wineboot (creates drive_c, registers built-in DLLs, writes registry hives,
+    # installs fonts). If a server start fires while this is still in progress,
+    # ARK crashes silently before logs flush -- producing the "doesn't work for
+    # 10 minutes then suddenly works" pattern. wineboot here forces the init to
+    # completion now, and wineserver -w blocks until every Wine process in the
+    # prefix has exited cleanly, guaranteeing the prefix is fully ready before
+    # the initial server start below.
+    if [ ! -f "$UMU_PREFIX_DIR/system.reg" ] || [ ! -d "$UMU_PREFIX_DIR/drive_c/windows/system32" ]; then
+        echo -e "${CYAN}Initializing Wine prefix (one-time, ~30-60s)...${RESET}"
+        WINEPREFIX="$UMU_PREFIX_DIR" \
+        GAMEID="$UMU_GAMEID" \
+        PROTONPATH="$UMU_PROTONPATH" \
+            "$UMU_RUN_BIN" wineboot --init >/dev/null 2>&1 || true
+        # wineserver may not be on PATH (umu's wine binary is sandboxed), so we
+        # poll the prefix's lockfile until no wineserver instance is holding it.
+        # Falls back to a fixed timeout to avoid hanging forever.
+        local waited=0
+        while [ "$waited" -lt 90 ]; do
+            if ! pgrep -f "wineserver.*$UMU_PREFIX_DIR" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 2
+            waited=$((waited + 2))
+        done
+        echo -e "${GREEN}Wine prefix ready.${RESET}"
     fi
 
     # Install or update ARK server using SteamCMD
     echo -e "${CYAN}Installing/updating ARK server...${RESET}"
     "$STEAMCMD_DIR/steamcmd.sh" +force_install_dir "$SERVER_FILES_DIR" +login anonymous +app_update 2430930 validate +quit
 
+    # ------------------------------------------------------------------
+    # ASA-on-Wine 10 compatibility fixes (idempotent -- safe to re-run).
+    # Required since the GE-Proton 10 / Wine 10 stack:
+    #
+    #   1. Disable the Sentry crash-reporter plugin. ASA ships a sentry-native
+    #      crashpad backend that reads StackLimit/StackBase from Wine's TEB.
+    #      Wine 10 returns huge values there, so crashpad attempts to dump
+    #      gigabytes of stack and the engine never proceeds past sentry_init.
+    #      Renaming the plugin folder makes the engine skip loading it and
+    #      sentry_init() fails cleanly with "invalid handler_path" -- engine
+    #      then continues normally.
+    #
+    #   2. Place a steam_appid.txt next to ArkAscendedServer.exe. lsteamclient.dll
+    #      reads this to identify itself to the Steam SDK without a running
+    #      Steam client. AppID 2430930 = ARK: Survival Ascended.
+    #
+    #   3. Symlink SteamCMD's bundled steamclient.so into $HOME/.steam/sdk{32,64}/.
+    #      Wine's lsteamclient.dll dlopen()'s these exact paths to bridge to the
+    #      native Steam SDK. Without them, server crashes inside
+    #      FSteamServerInstanceHandler with a stack trace through lsteamclient.dll.
+    # ------------------------------------------------------------------
+    local plugins_dir="$SERVER_FILES_DIR/ShooterGame/Plugins"
+    if [ -d "$plugins_dir/sentry" ]; then
+        echo -e "${CYAN}Disabling Sentry crashpad plugin (incompatible with Wine 10)...${RESET}"
+        # If a previous .disabled directory exists (e.g. SteamCMD validate
+        # re-downloaded the plugin while a stale .disabled was still around),
+        # remove it first so mv doesn't fail under `set -e`.
+        rm -rf "$plugins_dir/sentry.disabled"
+        mv "$plugins_dir/sentry" "$plugins_dir/sentry.disabled"
+        echo -e "${GREEN}Sentry plugin renamed to sentry.disabled.${RESET}"
+    elif [ -d "$plugins_dir/sentry.disabled" ]; then
+        echo -e "${GREEN}Sentry plugin already disabled.${RESET}"
+    fi
+
+    local win64_dir="$SERVER_FILES_DIR/ShooterGame/Binaries/Win64"
+    if [ -d "$win64_dir" ] && [ ! -f "$win64_dir/steam_appid.txt" ]; then
+        echo "2430930" > "$win64_dir/steam_appid.txt"
+        echo -e "${GREEN}Created steam_appid.txt (AppID 2430930).${RESET}"
+    fi
+
+    # Steam SDK symlinks. Use $HOME because lsteamclient.dll resolves them
+    # via the runtime user's home directory, regardless of WINEPREFIX.
+    local steam_sdk32="$HOME/.steam/sdk32"
+    local steam_sdk64="$HOME/.steam/sdk64"
+    local steamcmd_so32="$STEAMCMD_DIR/linux32/steamclient.so"
+    local steamcmd_so64="$STEAMCMD_DIR/linux64/steamclient.so"
+    if [ -f "$steamcmd_so32" ] && [ -f "$steamcmd_so64" ]; then
+        mkdir -p "$steam_sdk32" "$steam_sdk64"
+        # -f forces overwrite so a stale symlink (e.g. from a previous BASE_DIR)
+        # gets refreshed to point at the current install.
+        ln -sf "$steamcmd_so32" "$steam_sdk32/steamclient.so"
+        ln -sf "$steamcmd_so64" "$steam_sdk64/steamclient.so"
+        echo -e "${GREEN}Steam SDK symlinks in place ($steam_sdk32, $steam_sdk64).${RESET}"
+    else
+        echo -e "${YELLOW}Warning: SteamCMD steamclient.so not found at expected paths -- the server may fail to start.${RESET}"
+    fi
+    # ------------------------------------------------------------------
+
     # Check if configuration directory exists
     if [ ! -d "$SERVER_FILES_DIR/ShooterGame/Saved/Config/WindowsServer/" ]; then
-        echo -e "${CYAN}First installation detected. Initializing Proton prefix...${RESET}"
+        echo -e "${CYAN}First installation detected. Generating initial server configuration via umu-launcher...${RESET}"
+        echo -e "${CYAN}Starting server once to generate configuration files...${RESET}"
 
-        # Set Proton environment variables
-        export STEAM_COMPAT_DATA_PATH="$SERVER_FILES_DIR/steamapps/compatdata/2430930"
-        export STEAM_COMPAT_CLIENT_INSTALL_PATH="$BASE_DIR"
+        # Log the initial bootstrap so failures are diagnosable instead of silent.
+        local init_log="$BASE_DIR/initial-setup.log"
 
-        # Initialize Proton prefix
-        initialize_proton_prefix
-
-        echo -e "${CYAN}Starting server once to generate configuration files... This will take 60 seconds${RESET}"
-
-        # Initial server start to generate configs
-        "$PROTON_DIR/proton" run "$SERVER_FILES_DIR/ShooterGame/Binaries/Win64/ArkAscendedServer.exe" \
+        # Initial server start to generate configs -- via umu-run
+        WINEPREFIX="$UMU_PREFIX_DIR" \
+        GAMEID="$UMU_GAMEID" \
+        PROTONPATH="$UMU_PROTONPATH" \
+            "$UMU_RUN_BIN" "$SERVER_FILES_DIR/ShooterGame/Binaries/Win64/ArkAscendedServer.exe" \
             "TheIsland_WP?listen" \
             -NoBattlEye \
             -crossplay \
             -server \
             -log \
-            -nosteamclient \
-            -game &
-        # Wait to generate files
-        sleep 60
+            -game \
+            > "$init_log" 2>&1 &
+        local init_pid=$!
+
+        # Wait actively until the config directory appears, instead of a fixed sleep.
+        # ARK generates the config dir within ~30-60s of a successful boot.
+        local waited=0
+        local timeout=180
+        while [ "$waited" -lt "$timeout" ]; do
+            if [ -d "$SERVER_FILES_DIR/ShooterGame/Saved/Config/WindowsServer/" ]; then
+                echo -e "${GREEN}Initial config directory created after ${waited}s.${RESET}"
+                # Let it run another 20s to make sure all default INIs are written.
+                sleep 20
+                break
+            fi
+            # Bail out early if the umu/server process died -- something is wrong,
+            # and we shouldn't waste time waiting for files that will never appear.
+            if ! kill -0 "$init_pid" 2>/dev/null && ! pgrep -f "ArkAscendedServer.exe" > /dev/null; then
+                echo -e "${RED}Initial server process exited prematurely. See $init_log for details.${RESET}"
+                tail -n 30 "$init_log" || true
+                return 1
+            fi
+            sleep 5
+            waited=$((waited + 5))
+        done
+
+        if [ "$waited" -ge "$timeout" ]; then
+            echo -e "${YELLOW}Timeout waiting for config files. Check $init_log -- the server may still be starting.${RESET}"
+        fi
+
         # Stop the server
         pkill -f "ArkAscendedServer.exe.*TheIsland_WP" || true
+        # Give umu/proton time to clean up
+        sleep 5
         echo -e "${GREEN}Initial server start completed.${RESET}"
     else
         echo -e "${GREEN}Server configuration directory already exists. Skipping initial server start.${RESET}"
@@ -367,17 +552,14 @@ install_base_server() {
     echo -e "${GREEN}Base server installation/update completed.${RESET}"
 }
 
-# Function to initialize Proton prefix
+# Function to initialize Proton prefix (kept as no-op stub for backwards compatibility
+# with existing menu/instance creation code paths -- umu-launcher initializes its own
+# prefix automatically on first run, so nothing to do here).
 initialize_proton_prefix() {
-    local proton_prefix="$SERVER_FILES_DIR/steamapps/compatdata/2430930"
-
-    # Ensure the directory exists
-    mkdir -p "$proton_prefix"
-
-    # Copy the default Proton prefix
-    cp -r "$PROTON_DIR/files/share/default_pfx/." "$proton_prefix/"
-
-    echo -e "${GREEN}Proton prefix initialized.${RESET}"
+    # umu-launcher creates and manages WINEPREFIX itself on first run.
+    # We just make sure the directory exists so umu has a place to write.
+    mkdir -p "$UMU_PREFIX_DIR"
+    echo -e "${GREEN}umu-launcher will initialize its prefix on first server start.${RESET}"
 }
 
 # Function to populate an array with available instances from INSTANCES_DIR
@@ -569,9 +751,9 @@ start_server() {
 
     echo -e "${CYAN}Starting server for instance: $instance${RESET}"
 
-    # Set Proton environment variables
-    export STEAM_COMPAT_DATA_PATH="$SERVER_FILES_DIR/steamapps/compatdata/2430930"
-    export STEAM_COMPAT_CLIENT_INSTALL_PATH="$BASE_DIR"
+    # Ensure umu prefix dir exists -- umu-launcher creates / migrates its prefix
+    # automatically on first run inside WINEPREFIX.
+    mkdir -p "$UMU_PREFIX_DIR"
 
     # Ensure per-instance Config directory exists
     local instance_config_dir="$INSTANCES_DIR/$instance/Config"
@@ -607,7 +789,46 @@ start_server() {
 
     # Adding a trailing space to the ServerName to avoid conflicts if the ServerName is identical to the instance name.
     # This ensures the server processes the name correctly, even though the space is invisible to users.
-    "$PROTON_DIR/proton" run "$SERVER_FILES_DIR/ShooterGame/Binaries/Win64/ArkAscendedServer.exe" \
+    local server_log="$INSTANCES_DIR/$instance/server.log"
+    local shootergame_log="$SERVER_FILES_DIR/ShooterGame/Saved/Logs/ShooterGame.log"
+
+    # Write the exact command that's about to run to the top of server.log.
+    # This makes silent-exit cases diagnosable: you can always see what argv ARK got.
+    {
+        echo "=== ark_instance_manager.sh server launch ==="
+        echo "Timestamp:   $(date -Iseconds)"
+        echo "Instance:    $instance"
+        echo "WINEPREFIX:  $UMU_PREFIX_DIR"
+        echo "GAMEID:      $UMU_GAMEID"
+        echo "PROTONPATH:  $UMU_PROTONPATH"
+        echo "UMU_RUN_BIN: $UMU_RUN_BIN"
+        echo "Command:"
+        echo "  $UMU_RUN_BIN \\"
+        echo "    $SERVER_FILES_DIR/ShooterGame/Binaries/Win64/ArkAscendedServer.exe \\"
+        echo "    \"$MAP_NAME?listen?SessionName=$SERVER_NAME ?ServerPassword=$SERVER_PASSWORD?RCONEnabled=True?ServerAdminPassword=$ADMIN_PASSWORD?AltSaveDirectoryName=$SAVE_DIR\" \\"
+        echo "    $CUSTOM_START_PARAMETERS \\"
+        echo "    -WinLiveMaxPlayers=$MAX_PLAYERS -Port=$GAME_PORT -QueryPort=$QUERY_PORT -RCONPort=$RCON_PORT \\"
+        echo "    -game $cluster_params -server -log -mods=\"$MOD_IDS\""
+        echo "=== launch output below ==="
+        echo
+    } > "$server_log"
+
+    # Start the server fully detached from the shell session:
+    #   - setsid puts the process in its own session and process group, so it
+    #     no longer receives SIGHUP when the controlling terminal closes (e.g.
+    #     when the user exits the script, closes their terminal window, or
+    #     disconnects from SSH).
+    #   - nohup additionally ignores SIGHUP at the process level as a belt-and-
+    #     braces measure, and prevents tty access errors when stdin is closed.
+    #   - </dev/null detaches stdin so the process never blocks on terminal I/O.
+    #   - Background (&) returns control to the script.
+    #   - `disown` (after the &) removes the job from Bash's tracking, so a
+    #     subsequent shell exit doesn't try to clean it up.
+    setsid nohup env \
+        WINEPREFIX="$UMU_PREFIX_DIR" \
+        GAMEID="$UMU_GAMEID" \
+        PROTONPATH="$UMU_PROTONPATH" \
+        "$UMU_RUN_BIN" "$SERVER_FILES_DIR/ShooterGame/Binaries/Win64/ArkAscendedServer.exe" \
     "$MAP_NAME?listen?SessionName=$SERVER_NAME ?ServerPassword=$SERVER_PASSWORD?RCONEnabled=True?ServerAdminPassword=$ADMIN_PASSWORD?AltSaveDirectoryName=$SAVE_DIR" \
     $CUSTOM_START_PARAMETERS \
     -WinLiveMaxPlayers=$MAX_PLAYERS \
@@ -619,9 +840,67 @@ start_server() {
     -server \
     -log \
     -mods="$MOD_IDS" \
-    > "$INSTANCES_DIR/$instance/server.log" 2>&1 &
+    </dev/null >> "$server_log" 2>&1 &
+    local launcher_pid=$!
+    disown "$launcher_pid" 2>/dev/null || true
 
-    echo -e "${GREEN}Server started for instance: $instance. It should be fully operational in approximately 60 seconds.${RESET}"
+    echo -e "${CYAN}Launcher PID: $launcher_pid (detached). Verifying server boot...${RESET}"
+
+    # Health check: ARK on Wine needs ~10-20 seconds before ArkAscendedServer.exe
+    # is visible in the process tree (umu sets up SLR container, then wine, then
+    # the .exe). We wait up to 30s for the process to appear, then another 15s
+    # to see if it stays alive. Silent exits show up here instead of being
+    # discovered minutes later when the user notices the server isn't pingable.
+    local found=0
+    local waited=0
+    while [ "$waited" -lt 30 ]; do
+        if pgrep -f "ArkAscendedServer.exe.*AltSaveDirectoryName=$SAVE_DIR" >/dev/null 2>&1; then
+            found=1
+            break
+        fi
+        # Launcher itself died before ARK even spawned -- usually a umu/wine error.
+        if ! kill -0 "$launcher_pid" 2>/dev/null; then
+            break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+
+    if [ "$found" -ne 1 ]; then
+        echo -e "${RED}ArkAscendedServer.exe did not appear within 30 seconds.${RESET}"
+        echo -e "${YELLOW}--- last 30 lines of $server_log ---${RESET}"
+        tail -n 30 "$server_log" 2>/dev/null || echo "(server.log not readable)"
+        echo -e "${YELLOW}--- end of server.log ---${RESET}"
+        if [ -f "$shootergame_log" ]; then
+            echo -e "${YELLOW}--- last 20 lines of ShooterGame.log ---${RESET}"
+            tail -n 20 "$shootergame_log"
+            echo -e "${YELLOW}--- end of ShooterGame.log ---${RESET}"
+        fi
+        echo -e "${RED}Server failed to start. Full logs: $server_log${RESET}"
+        return 1
+    fi
+
+    # Process appeared. Watch for ~15s more to make sure it doesn't die during
+    # early engine init (the "PrimalGameData then silent exit" failure mode).
+    local stable_waited=0
+    while [ "$stable_waited" -lt 15 ]; do
+        if ! pgrep -f "ArkAscendedServer.exe.*AltSaveDirectoryName=$SAVE_DIR" >/dev/null 2>&1; then
+            echo -e "${RED}ArkAscendedServer.exe exited during engine init after ${stable_waited}s.${RESET}"
+            echo -e "${YELLOW}--- last 30 lines of server.log ---${RESET}"
+            tail -n 30 "$server_log" 2>/dev/null
+            if [ -f "$shootergame_log" ]; then
+                echo -e "${YELLOW}--- last 40 lines of ShooterGame.log ---${RESET}"
+                tail -n 40 "$shootergame_log"
+            fi
+            echo -e "${RED}Server crashed during boot. Full logs: $server_log + $shootergame_log${RESET}"
+            return 1
+        fi
+        sleep 3
+        stable_waited=$((stable_waited + 3))
+    done
+
+    echo -e "${GREEN}Server for instance '$instance' is running (took ${waited}s to spawn, stable for ${stable_waited}s).${RESET}"
+    echo -e "${GREEN}Full boot to playable state usually takes 30-90 seconds more (map load).${RESET}"
 }
 
 # Function to stop the server
