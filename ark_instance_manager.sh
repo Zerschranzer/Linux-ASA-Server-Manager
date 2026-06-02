@@ -59,10 +59,14 @@ check_dependencies() {
     local config_file="$BASE_DIR/.ark_server_manager_config"
 
     # Detect the package manager
-    # umu-launcher zipapp is shipped self-contained; we no longer need 32-bit libs
-    # (libc6:i386, libstdc++6:i386, libncursesw6:i386, libfreetype6:i386, etc).
-    # umu brings the Steam Linux Runtime which provides everything Proton needs.
+    # umu-launcher zipapp is self-contained for Proton/Wine (ships Steam Linux Runtime).
+    # However, SteamCMD is a standalone 32-bit ELF binary requiring the host's 32-bit
+    # dynamic linker (/lib/ld-linux.so.2). Without i386 multilib the kernel returns
+    # ENOENT for the binary even though the file exists on disk.
     # Required at the host level:
+    #   - 32-bit glibc : SteamCMD is a 32-bit ELF binary (libc, libdl, libm,
+    #     libpthread, librt). Without i386 multilib the kernel cannot execute
+    #     it (returns ENOENT even though the file exists).
     #   - wget/tar : download umu-launcher zipapp + steamcmd + GE-Proton
     #   - python3 (>= 3.10) : run the umu-launcher zipapp
     #   - libzstd1/libzstd.so.1 : umu uses pyzstd which links against system libzstd
@@ -70,16 +74,16 @@ check_dependencies() {
     #   - cron : scheduled restarts
     if command -v apt-get >/dev/null 2>&1; then
         package_manager="apt-get"
-        dependencies=("wget" "tar" "grep" "python3" "libzstd1" "pkill" "cron")
+        dependencies=("wget" "tar" "grep" "python3" "libzstd1" "libc6:i386" "pkill" "cron")
     elif command -v zypper >/dev/null 2>&1; then
         package_manager="zypper"
-        dependencies=("wget" "tar" "grep" "python3" "libzstd1" "pkill" "cron")
+        dependencies=("wget" "tar" "grep" "python3" "libzstd1" "glibc-32bit" "pkill" "cron")
     elif command -v dnf >/dev/null 2>&1; then
         package_manager="dnf"
-        dependencies=("wget" "tar" "grep" "python3" "libzstd" "procps-ng" "cronie")
+        dependencies=("wget" "tar" "grep" "python3" "libzstd" "glibc.i686" "procps-ng" "cronie")
     elif command -v pacman >/dev/null 2>&1; then
         package_manager="pacman"
-        dependencies=("wget" "tar" "grep" "python" "zstd" "cronie")
+        dependencies=("wget" "tar" "grep" "python" "zstd" "cronie" "lib32-glibc")
     else
         echo -e "${RED}Error: No supported package manager found on this system.${RESET}"
         exit 1
