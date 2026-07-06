@@ -739,6 +739,8 @@ select_instance() {
 
 # Function to start the server
 start_server() {
+    export PROTON_VERB=run
+    
     local instance=$1
     # Check for duplicate ports
     if ! check_for_duplicate_ports; then
