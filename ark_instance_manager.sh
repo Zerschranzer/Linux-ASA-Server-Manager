@@ -45,9 +45,41 @@ UMU_VERSION="1.4.0"
 UMU_DIR="$BASE_DIR/umu-launcher"
 UMU_RUN_BIN="$UMU_DIR/umu-run"
 UMU_URL="https://github.com/Open-Wine-Components/umu-launcher/releases/download/$UMU_VERSION/umu-launcher-$UMU_VERSION-zipapp.tar"
-UMU_PROTONPATH="${UMU_PROTONPATH:-GE-Proton}"
 UMU_GAMEID="${UMU_GAMEID:-umu-default}"
 UMU_PREFIX_DIR="$BASE_DIR/umu-prefix"
+
+# GE-Proton is pinned and downloaded deterministically into $BASE_DIR, exactly
+# like the umu-launcher zipapp above -- rather than relying on umu's runtime
+# alias resolution (PROTONPATH=GE-Proton). The alias makes umu resolve+download
+# the latest GE-Proton from the GitHub *API* (api.github.com) on first run. That
+# API is rate-limited to 60 requests/hour per IP for unauthenticated callers, so
+# in containers, CI, CGNAT or shared-egress networks it frequently fails with
+# "Failed to acquire release assets from 'https://api.github.com'". umu 1.4.0
+# then aborts hard because PROTONPATH ends up empty (FileNotFoundError in
+# download_proton), or -- depending on cache state -- because a required Steam
+# Linux Runtime (e.g. steamrt4/toolmanifest.vdf) was never fetched.
+#
+# By downloading a fixed GE-Proton build from the release *download* URL
+# (codeload / release-asset delivery -- NOT the API, not rate-limited) and
+# pointing PROTONPATH at the concrete extracted directory, umu never needs to
+# contact the GitHub API for Proton. UMU_RUNTIME_UPDATE=0 additionally stops umu
+# from switching/upgrading the Steam Linux Runtime mid-flight (which would hit
+# the network again). The runtime itself is still fetched once by umu on first
+# run, but that comes from Valve's repos, not the GitHub API.
+# PINNED TO THE 10-SERIES ON PURPOSE. GE-Proton11-1 (Wine 11 base, built
+# 2026-06-24) has a regression with ArkAscendedServer.exe: the process hangs
+# forever during static import resolution (last loaded DLL: imm32.dll), before
+# a single line of engine code runs -- no crash, no exception, no UE log, the
+# server just never comes up. Verified 2026-07-09 on fresh Arch installs; the
+# identical setup works on GE-Proton10-34. Do not bump to a GE-Proton 11.x
+# build without testing a full cold start (success criterion: the
+# "minidumps folder is set to /tmp/dumps" line followed by UE log output).
+GE_PROTON_VERSION="${GE_PROTON_VERSION:-GE-Proton10-34}"
+GE_PROTON_DIR="$BASE_DIR/proton"
+GE_PROTON_PATH="$GE_PROTON_DIR/$GE_PROTON_VERSION"
+GE_PROTON_URL="https://github.com/GloriousEggroll/proton-ge-custom/releases/download/$GE_PROTON_VERSION/$GE_PROTON_VERSION.tar.gz"
+# PROTONPATH now points at the concrete build directory (overridable via env).
+UMU_PROTONPATH="${UMU_PROTONPATH:-$GE_PROTON_PATH}"
 
 # Define URL for SteamCMD.
 STEAMCMD_URL="https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
@@ -390,39 +422,113 @@ install_base_server() {
         echo -e "${GREEN}umu-launcher already installed.${RESET}"
     fi
 
-    # Pre-fetch the Steam Linux Runtime (sniper, ~300 MB) and GE-Proton (~500 MB)
-    # via a dummy umu-run invocation. Without this, the first real server start
-    # would block on these downloads -- which can take 5-15 minutes on slow
-    # connections and would race with the initial-config-generation logic below.
-    # Running `--help` triggers the runtime/proton fetch without launching anything.
-    if [ ! -d "$HOME/.local/share/umu/steamrt3" ] || \
-       [ ! "$(ls -A "$HOME/.local/share/umu/steamrt3" 2>/dev/null)" ]; then
-        echo -e "${CYAN}First-time umu setup: downloading Steam Linux Runtime + GE-Proton (~800 MB, may take several minutes)...${RESET}"
-        echo -e "${YELLOW}You will see download progress messages from umu below.${RESET}"
-        WINEPREFIX="$UMU_PREFIX_DIR" \
-        GAMEID="$UMU_GAMEID" \
-        PROTONPATH="$UMU_PROTONPATH" \
-            "$UMU_RUN_BIN" --help >/dev/null || true
-        echo -e "${GREEN}umu runtime ready.${RESET}"
+    # Download the pinned GE-Proton build if not already present. We fetch it
+    # ourselves from the release download URL (not the GitHub API) so umu never
+    # has to resolve the "GE-Proton" alias online -- see the comment block near
+    # the GE_PROTON_* definitions for why the alias path is unreliable.
+    if [ ! -x "$GE_PROTON_PATH/proton" ]; then
+        echo -e "${CYAN}Downloading $GE_PROTON_VERSION (~450 MB, may take several minutes)...${RESET}"
+        mkdir -p "$GE_PROTON_DIR"
+        local ge_tar="$GE_PROTON_DIR/$GE_PROTON_VERSION.tar.gz"
+        if ! wget -q -O "$ge_tar" "$GE_PROTON_URL"; then
+            rm -f "$ge_tar"
+            echo -e "${RED}Error: failed to download $GE_PROTON_VERSION from:${RESET}"
+            echo -e "${YELLOW}  $GE_PROTON_URL${RESET}"
+            echo -e "${CYAN}Check your network connection, or set GE_PROTON_VERSION to a build that exists.${RESET}"
+            exit 1
+        fi
+        # The tarball contains a top-level GE-ProtonXX-Y/ directory, so a plain
+        # extract into $GE_PROTON_DIR yields $GE_PROTON_DIR/$GE_PROTON_VERSION.
+        if ! tar -xzf "$ge_tar" -C "$GE_PROTON_DIR"; then
+            rm -f "$ge_tar"
+            echo -e "${RED}Error: extraction of $GE_PROTON_VERSION failed (corrupt download?).${RESET}"
+            exit 1
+        fi
+        rm -f "$ge_tar"
+        if [ ! -x "$GE_PROTON_PATH/proton" ]; then
+            echo -e "${RED}Error: $GE_PROTON_VERSION extracted but $GE_PROTON_PATH/proton is missing.${RESET}"
+            echo -e "${YELLOW}The archive layout may have changed; check $GE_PROTON_DIR.${RESET}"
+            exit 1
+        fi
+        echo -e "${GREEN}$GE_PROTON_VERSION installed at $GE_PROTON_PATH.${RESET}"
+    else
+        echo -e "${GREEN}$GE_PROTON_VERSION already installed.${RESET}"
     fi
 
-    # Warm up the Wine prefix synchronously. Wine's first-time prefix init runs
-    # wineboot (creates drive_c, registers built-in DLLs, writes registry hives,
-    # installs fonts). If a server start fires while this is still in progress,
-    # ARK crashes silently before logs flush -- producing the "doesn't work for
-    # 10 minutes then suddenly works" pattern. wineboot here forces the init to
-    # completion now, and wineserver -w blocks until every Wine process in the
-    # prefix has exited cleanly, guaranteeing the prefix is fully ready before
-    # the initial server start below.
-    if [ ! -f "$UMU_PREFIX_DIR/system.reg" ] || [ ! -d "$UMU_PREFIX_DIR/drive_c/windows/system32" ]; then
-        echo -e "${CYAN}Initializing Wine prefix (one-time, ~30-60s)...${RESET}"
+    # Pre-fetch the Steam Linux Runtime via a real umu invocation. Without this,
+    # the first real server start would block on the runtime download -- which
+    # can take several minutes and would race with the initial-config-generation
+    # logic below. We deliberately do NOT use `umu-run --help` here: on umu 1.4.0
+    # --help exits before the runtime layer is resolved/downloaded, so it no
+    # longer triggers the fetch (this is exactly what left users with a missing
+    # steamrt4/toolmanifest.vdf). `wineboot --init` runs through the full runtime
+    # layer and thus reliably pulls the runtime. It also doubles as the Wine
+    # prefix warm-up below, so the two former steps are merged into one.
+    #
+    # The Wine prefix must match the Proton generation that created it. A
+    # prefix initialized by Wine 11 (GE-Proton11-x) must not be reused with
+    # Wine 10 (GE-Proton10-x) -- Wine downgrades on an existing prefix are
+    # unsupported and cause subtle breakage. We record which GE-Proton build
+    # created the prefix in a marker file; on mismatch (or if the marker is
+    # missing, i.e. the prefix predates this mechanism and its provenance is
+    # unknown -- which includes every prefix created by the briefly-pinned,
+    # ASA-incompatible GE-Proton11-1), the prefix is moved aside and recreated.
+    # Recreating costs ~1 minute and loses nothing: all server data (configs,
+    # saves) lives under server-files/, not in the prefix.
+    local prefix_marker="$UMU_PREFIX_DIR/.created-by-proton"
+    if [ -f "$UMU_PREFIX_DIR/system.reg" ]; then
+        local prefix_proton=""
+        [ -f "$prefix_marker" ] && prefix_proton="$(cat "$prefix_marker" 2>/dev/null)"
+        if [ "$prefix_proton" != "$GE_PROTON_VERSION" ]; then
+            local prefix_backup="${UMU_PREFIX_DIR}.bak-${prefix_proton:-unknown}"
+            echo -e "${YELLOW}Existing Wine prefix was created by '${prefix_proton:-an unknown Proton build}', current is $GE_PROTON_VERSION.${RESET}"
+            echo -e "${CYAN}Moving it to $prefix_backup and creating a fresh prefix...${RESET}"
+            rm -rf "$prefix_backup"
+            mv "$UMU_PREFIX_DIR" "$prefix_backup"
+            mkdir -p "$UMU_PREFIX_DIR"
+        fi
+    fi
+
+    # Runtime check: the required Steam Linux Runtime depends on the Proton
+    # generation (GE-Proton 9/10 -> steamrt3 "sniper", GE-Proton 11 -> steamrt4),
+    # so a present steamrt4 must not mask a missing steamrt3 after a downgrade
+    # (and vice versa). Unknown/future generations fall back to accepting any
+    # installed runtime and letting umu sort it out during the warm-up run.
+    local umu_share="$HOME/.local/share/umu"
+    local required_runtime_glob="steamrt*"
+    case "$GE_PROTON_VERSION" in
+        GE-Proton9-*|GE-Proton10-*) required_runtime_glob="steamrt3" ;;
+        GE-Proton11-*)              required_runtime_glob="steamrt4" ;;
+    esac
+    local prefix_ready=1
+    [ -f "$UMU_PREFIX_DIR/system.reg" ] && [ -d "$UMU_PREFIX_DIR/drive_c/windows/system32" ] || prefix_ready=0
+    local runtime_ready=0
+    if compgen -G "$umu_share/$required_runtime_glob/toolmanifest.vdf" >/dev/null 2>&1; then
+        runtime_ready=1
+    fi
+
+    if [ "$runtime_ready" -eq 0 ] || [ "$prefix_ready" -eq 0 ]; then
+        echo -e "${CYAN}First-time umu setup: downloading Steam Linux Runtime and initializing Wine prefix (may take several minutes)...${RESET}"
+        echo -e "${YELLOW}You will see progress messages from umu below.${RESET}"
+        # wineboot --init forces: (a) runtime download via the full umu layer,
+        # (b) Wine prefix creation (drive_c, registry hives, built-in DLL
+        # registration, fonts). Doing this synchronously here prevents ARK from
+        # firing against a half-initialized prefix during the config-gen start
+        # below (the classic "crashes silently for 10 minutes then works").
+        #
+        # Deliberately NO UMU_RUNTIME_UPDATE=0 on this one invocation: this is
+        # the run that must be able to fetch a missing runtime. After a Proton
+        # downgrade (11.x -> 10.x) the box may have steamrt4 but not steamrt3;
+        # with updates disabled umu would not pull the missing one. All regular
+        # server starts keep UMU_RUNTIME_UPDATE=0 -- by then the runtime is
+        # guaranteed present.
         WINEPREFIX="$UMU_PREFIX_DIR" \
         GAMEID="$UMU_GAMEID" \
         PROTONPATH="$UMU_PROTONPATH" \
             "$UMU_RUN_BIN" wineboot --init >/dev/null 2>&1 || true
         # wineserver may not be on PATH (umu's wine binary is sandboxed), so we
-        # poll the prefix's lockfile until no wineserver instance is holding it.
-        # Falls back to a fixed timeout to avoid hanging forever.
+        # poll until no wineserver instance is holding the prefix, with a
+        # fixed-timeout fallback to avoid hanging forever.
         local waited=0
         while [ "$waited" -lt 90 ]; do
             if ! pgrep -f "wineserver.*$UMU_PREFIX_DIR" >/dev/null 2>&1; then
@@ -431,8 +537,11 @@ install_base_server() {
             sleep 2
             waited=$((waited + 2))
         done
-        echo -e "${GREEN}Wine prefix ready.${RESET}"
+        echo -e "${GREEN}umu runtime and Wine prefix ready.${RESET}"
     fi
+
+    # Record which Proton build owns this prefix (see migration logic above).
+    echo "$GE_PROTON_VERSION" > "$UMU_PREFIX_DIR/.created-by-proton"
 
     # Install or update ARK server using SteamCMD
     echo -e "${CYAN}Installing/updating ARK server...${RESET}"
@@ -472,10 +581,13 @@ install_base_server() {
         echo -e "${GREEN}Sentry plugin already disabled.${RESET}"
     fi
 
+    # Compare content, not just existence: older script versions wrote the
+    # *game* AppID (2399830) here, and a stale file would otherwise never be
+    # corrected. lsteamclient needs the *dedicated server* AppID (2430930).
     local win64_dir="$SERVER_FILES_DIR/ShooterGame/Binaries/Win64"
-    if [ -d "$win64_dir" ] && [ ! -f "$win64_dir/steam_appid.txt" ]; then
+    if [ -d "$win64_dir" ] && [ "$(cat "$win64_dir/steam_appid.txt" 2>/dev/null)" != "2430930" ]; then
         echo "2430930" > "$win64_dir/steam_appid.txt"
-        echo -e "${GREEN}Created steam_appid.txt (AppID 2430930).${RESET}"
+        echo -e "${GREEN}Wrote steam_appid.txt (AppID 2430930).${RESET}"
     fi
 
     # Steam SDK symlinks. Use $HOME because lsteamclient.dll resolves them
@@ -508,6 +620,7 @@ install_base_server() {
         WINEPREFIX="$UMU_PREFIX_DIR" \
         GAMEID="$UMU_GAMEID" \
         PROTONPATH="$UMU_PROTONPATH" \
+        UMU_RUNTIME_UPDATE=0 \
             "$UMU_RUN_BIN" "$SERVER_FILES_DIR/ShooterGame/Binaries/Win64/ArkAscendedServer.exe" \
             "TheIsland_WP?listen" \
             -NoBattlEye \
@@ -740,7 +853,7 @@ select_instance() {
 # Function to start the server
 start_server() {
     export PROTON_VERB=run
-    
+
     local instance=$1
     # Check for duplicate ports
     if ! check_for_duplicate_ports; then
@@ -834,6 +947,7 @@ start_server() {
         WINEPREFIX="$UMU_PREFIX_DIR" \
         GAMEID="$UMU_GAMEID" \
         PROTONPATH="$UMU_PROTONPATH" \
+        UMU_RUNTIME_UPDATE=0 \
         "$UMU_RUN_BIN" "$SERVER_FILES_DIR/ShooterGame/Binaries/Win64/ArkAscendedServer.exe" \
     "$MAP_NAME?listen?SessionName=$SERVER_NAME ?ServerPassword=$SERVER_PASSWORD?RCONEnabled=True?ServerAdminPassword=$ADMIN_PASSWORD?AltSaveDirectoryName=$SAVE_DIR" \
     $CUSTOM_START_PARAMETERS \
