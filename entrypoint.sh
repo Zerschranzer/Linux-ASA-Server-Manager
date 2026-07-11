@@ -132,6 +132,11 @@ update_ark() {
 
 generate_initial_config() {
     local config_dir="$ARK_BINARIES/ShooterGame/Saved/Config/WindowsServer"
+    # A dangling symlink from the native manager must not fool -d (which
+    # follows symlinks and returns false on dangling ones).
+    if [ -L "$config_dir" ] && [ ! -d "$config_dir" ]; then
+        rm -f "$config_dir"
+    fi
     if [ -d "$config_dir" ]; then
         return 0
     fi
@@ -181,13 +186,19 @@ run_server() {
     generate_initial_config
 
     local config_dir="$ARK_BINARIES/ShooterGame/Saved/Config/WindowsServer"
+    # The native manager replaces this dir with a symlink to a host-absolute
+    # instances/ path. Inside the container that link is dangling. Remove it
+    # so both managers can share the same server-files mount.
+    if [ -L "$config_dir" ]; then
+        rm -f "$config_dir"
+    fi
     mkdir -p "$config_dir"
-    if [ -f "$ARK_INSTANCE/Game.ini" ]; then
-        ln -sf "$ARK_INSTANCE/Game.ini" "$config_dir/Game.ini"
+    if [ -f "$ARK_INSTANCE/Config/Game.ini" ]; then
+        ln -sf "$ARK_INSTANCE/Config/Game.ini" "$config_dir/Game.ini"
         echo -e "${GREEN}>>> Loaded instance Game.ini${RESET}"
     fi
-    if [ -f "$ARK_INSTANCE/GameUserSettings.ini" ]; then
-        ln -sf "$ARK_INSTANCE/GameUserSettings.ini" "$config_dir/GameUserSettings.ini"
+    if [ -f "$ARK_INSTANCE/Config/GameUserSettings.ini" ]; then
+        ln -sf "$ARK_INSTANCE/Config/GameUserSettings.ini" "$config_dir/GameUserSettings.ini"
         echo -e "${GREEN}>>> Loaded instance GameUserSettings.ini${RESET}"
     fi
 

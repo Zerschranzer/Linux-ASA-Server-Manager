@@ -456,8 +456,6 @@ start_server() {
         -v "$BINARIES_DIR:/ark/binaries" \
         -v "$inst_dir:/ark/instance" \
         -v "$BASE_DIR/umu-data:/tmp/umu-home" \
-        -v "$config_dir/Game.ini:/ark/binaries/ShooterGame/Saved/Config/WindowsServer/Game.ini:rw" \
-        -v "$config_dir/GameUserSettings.ini:/ark/binaries/ShooterGame/Saved/Config/WindowsServer/GameUserSettings.ini:rw" \
         "$IMAGE_NAME" run \
         "$MAP_NAME?listen?SessionName=$SERVER_NAME ?ServerPassword=$SERVER_PASSWORD?RCONEnabled=True?ServerAdminPassword=$ADMIN_PASSWORD?AltSaveDirectoryName=$SAVE_DIR" \
             $CUSTOM_START_PARAMETERS \
