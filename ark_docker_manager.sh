@@ -4,6 +4,8 @@ export LC_ALL=C.UTF-8
 export LANG=C.UTF-8
 export LANGUAGE=C.UTF-8
 
+set -e
+
 # Color definitions
 RED='\e[31m'
 GREEN='\e[32m'
@@ -13,7 +15,12 @@ MAGENTA='\e[35m'
 CYAN='\e[36m'
 RESET='\e[0m'
 
-# Docker-Image-Name
+# Signal handling. When the user hits Ctrl-C or the script gets SIGTERM,
+# detached containers keep running -- they are independently managed by
+# the Docker daemon.
+trap 'echo -e "${RED}Script interrupted. Running containers are unaffected.${RESET}"; exit 130' SIGINT SIGTERM
+
+# Docker image name
 IMAGE_NAME="ark-ascended-base"
 
 # Base directory for all instances
@@ -22,11 +29,32 @@ BINARIES_DIR="$BASE_DIR/server-files"
 INSTANCES_DIR="$BASE_DIR/instances"
 RCON_SCRIPT="$BASE_DIR/rcon.py"
 ARK_RESTART_MANAGER="$BASE_DIR/ark_restart_manager.sh"
-ARK_INSTANCE_MANAGER="$BASE_DIR/ark_docker_manager.sh"
+ARK_DOCKER_MANAGER="$BASE_DIR/ark_docker_manager.sh"
+
+# ------------------------------------------------------------------
+# Ubuntu 23.10+ restricts unprivileged user namespaces via AppArmor.
+# The Steam Linux Runtime container (pressure-vessel/bwrap) needs
+# unprivileged userns. This check mirrors ark_instance_manager.sh.
+# ------------------------------------------------------------------
+check_userns_restriction() {
+    local restricted
+    restricted="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" || return 0
+    if [ "$restricted" = "1" ]; then
+        echo -e "${RED}Error: this system restricts unprivileged user namespaces (Ubuntu AppArmor hardening).${RESET}"
+        echo -e "${YELLOW}The Steam Linux Runtime container cannot start under this restriction.${RESET}"
+        echo
+        echo -e "${CYAN}Fix (apply now + persist across reboots):${RESET}"
+        echo "    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+        echo "    echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | sudo tee /etc/sysctl.d/99-umu-userns.conf"
+        echo
+        echo -e "${CYAN}Then re-run this script.${RESET}"
+        exit 1
+    fi
+}
 
 # Function to check if required scripts are executable
 check_executables() {
-    local required_files=("$RCON_SCRIPT" "$ARK_RESTART_MANAGER" "$ARK_INSTANCE_MANAGER")
+    local required_files=("$RCON_SCRIPT" "$ARK_RESTART_MANAGER" "$ARK_DOCKER_MANAGER")
     for file in "${required_files[@]}"; do
         if [ ! -x "$file" ]; then
             echo -e "${RED}Error: Required file '$file' is not executable.${RESET}"
@@ -38,14 +66,12 @@ check_executables() {
 
 # Check if Docker works properly for the script
 check_docker() {
-    # Check if Docker is installed
     if ! command -v docker &>/dev/null; then
         echo -e "${RED}Error: Docker is not installed or not in PATH.${RESET}"
         echo -e "${YELLOW}Please install Docker using your package manager.${RESET}"
         exit 1
     fi
 
-    # Check if the Docker daemon is running
     if ! systemctl is-active --quiet docker; then
         echo -e "${RED}Error: Docker daemon is not running.${RESET}"
         echo -e "${YELLOW}Start it with:${RESET} ${GREEN}sudo systemctl start docker${RESET}"
@@ -53,7 +79,6 @@ check_docker() {
         exit 1
     fi
 
-    # Check if the user has access to Docker
     if ! docker info &>/dev/null; then
         if id -nG "$USER" | grep -qw docker; then
             echo -e "${RED}You are in the 'docker' group, but your session does not reflect the updated group membership.${RESET}"
@@ -73,15 +98,13 @@ check_docker() {
 # Call the functions at the start of the script
 check_executables
 check_docker
+check_userns_restriction
 
-#Sets up a symlink
+# Sets up a symlink
 setup_symlink() {
-    # Target directory for the symlink
     local target_dir="$HOME/.local/bin"
-    # Name under which the script can be invoked
     local script_name="asa-manager"
 
-    # Check if the target directory exists
     if [ ! -d "$target_dir" ]; then
         echo -e "Creating directory $target_dir..."
         mkdir -p "$target_dir" || {
@@ -90,14 +113,12 @@ setup_symlink() {
         }
     fi
 
-    # Create or update the symlink
     echo -e "Creating or updating the symlink $target_dir/$script_name..."
     ln -sf "$(realpath "$0")" "$target_dir/$script_name" || {
         echo -e "Error: Could not create symlink."
         exit 1
     }
 
-    # Check if $HOME/.local/bin is in the PATH
     if [[ ":$PATH:" != *":$target_dir:"* ]]; then
         echo -e "Adding $target_dir to PATH..."
         echo 'export PATH=$PATH:$HOME/.local/bin' >> "$HOME/.bashrc"
@@ -107,8 +128,7 @@ setup_symlink() {
     echo -e "Setup completed. You can now run the script using 'asa-manager'."
 }
 
-# This function searches all instance_config.ini files in the $INSTANCES_DIR folder
-# and collects the ports into arrays
+# This function searches all instance_config.ini files for port conflicts
 check_for_duplicate_ports() {
     declare -A port_occurrences
     declare -A rcon_occurrences
@@ -116,7 +136,6 @@ check_for_duplicate_ports() {
 
     local duplicates_found=false
 
-    # Iterate over all instance folders
     for instance_dir in "$INSTANCES_DIR"/*; do
         if [ -d "$instance_dir" ]; then
             local config_file="$instance_dir/instance_config.ini"
@@ -124,18 +143,15 @@ check_for_duplicate_ports() {
                 local instance_name
                 instance_name=$(basename "$instance_dir")
 
-                # Extract ports from the config
                 local game_port rcon_port query_port
                 game_port=$(grep -E "^Port=" "$config_file" | cut -d= -f2- | xargs)
                 rcon_port=$(grep -E "^RCONPort=" "$config_file" | cut -d= -f2- | xargs)
                 query_port=$(grep -E "^QueryPort=" "$config_file" | cut -d= -f2- | xargs)
 
-                # Ignore entries if they are empty
                 [ -z "$game_port" ] && game_port="NULL"
                 [ -z "$rcon_port" ] && rcon_port="NULL"
                 [ -z "$query_port" ] && query_port="NULL"
 
-                # Check for conflicts
                 if [ "$game_port" != "NULL" ]; then
                     if [ -n "${port_occurrences[$game_port]}" ]; then
                         echo -e "${RED}Conflict: Game port $game_port is used by both '${port_occurrences[$game_port]}' and '$instance_name'.${RESET}"
@@ -185,14 +201,10 @@ ensure_base_image() {
 # Function to check if a container is running
 is_server_running() {
     local instance="$1"
-
-    # Check if an instance was provided
     if [[ -z "$instance" ]]; then
         echo "Error: No instance specified." >&2
         return 1
     fi
-
-    # Check if a container with the instance name is running
     if docker ps --filter "name=${instance}" --format "{{.Names}}" | grep -qw "${instance}"; then
         return 0
     else
@@ -200,27 +212,21 @@ is_server_running() {
     fi
 }
 
-# Function to populate an array with available instances from INSTANCES_DIR
+# Function to populate an array with available instances
 get_available_instances() {
-    # Clear the array to avoid stale entries
     available_instances=()
-
     if [ -d "$INSTANCES_DIR" ]; then
-        # Read all directories (one per line) into the array
         mapfile -t available_instances < <(ls -1 "$INSTANCES_DIR" 2>/dev/null)
     fi
 }
 
 # Function to list all instances
 list_instances() {
-    # Reuse the helper function
     get_available_instances
-
     if [ ${#available_instances[@]} -eq 0 ]; then
         echo -e "${RED}No instances found in '$INSTANCES_DIR'.${RESET}"
         return
     fi
-
     echo -e "${YELLOW}Available instances:${RESET}"
     for inst in "${available_instances[@]}"; do
         echo "$inst"
@@ -233,17 +239,14 @@ edit_instance_config() {
     local config_file="$INSTANCES_DIR/$instance/instance_config.ini"
     local game_ini_file="$INSTANCES_DIR/$instance/Config/Game.ini"
 
-    # Create instance directory if it doesn't exist
     if [ ! -d "$INSTANCES_DIR/$instance" ]; then
         mkdir -p "$INSTANCES_DIR/$instance"
     fi
 
-      # Create the Config directory if it doesn't exist
     if [ ! -d "$INSTANCES_DIR/$instance/Config" ]; then
         mkdir -p "$INSTANCES_DIR/$instance/Config"
     fi
 
-    # Create config file if it doesn't exist
     if [ ! -f "$config_file" ]; then
         cat <<EOF > "$config_file"
 [ServerSettings]
@@ -262,16 +265,14 @@ CustomStartParameters=-NoBattlEye -crossplay -NoHangDetection
 SaveDir=$instance
 ClusterID=
 EOF
-        chmod 600 "$config_file"  # Set file permissions to be owner-readable and writable
+        chmod 600 "$config_file"
     fi
 
-     # Create an empty Game.ini, if it doesnt exist
     if [ ! -f "$game_ini_file" ]; then
         touch "$game_ini_file"
         echo -e "${GREEN}Empty Game.ini for '$instance' Created. Optional: Edit it for your needs${RESET}"
     fi
 
-    # Open the config file in the default text editor
     if [ -n "$EDITOR" ]; then
         "$EDITOR" "$config_file"
     elif command -v nano >/dev/null 2>&1; then
@@ -293,7 +294,6 @@ load_instance_config() {
         return 1
     fi
 
-    # Read configuration into variables
     SERVER_NAME=$(grep -E '^ServerName=' "$config_file" | cut -d= -f2- | xargs)
     SERVER_PASSWORD=$(grep -E '^ServerPassword=' "$config_file" | cut -d= -f2- | xargs)
     ADMIN_PASSWORD=$(grep -E '^ServerAdminPassword=' "$config_file" | cut -d= -f2- | xargs)
@@ -310,9 +310,8 @@ load_instance_config() {
     return 0
 }
 
-# Function to create a new instance (using 'read' with validation)
+# Function to create a new instance
 create_instance() {
-
     while true; do
         echo -e "${CYAN}Enter the name for the new instance (or type 'cancel' to abort):${RESET}"
         read -r instance_name
@@ -326,7 +325,6 @@ create_instance() {
         else
             mkdir -p "$INSTANCES_DIR/$instance_name"
             edit_instance_config "$instance_name"
-            initialize_proton_prefix "$instance_name"
             echo -e "${GREEN}Instance $instance_name created and configured.${RESET}"
             return
         fi
@@ -338,7 +336,6 @@ select_instance() {
     local instances=()
     local i=1
 
-    # Populate the instances array
     for dir in "$INSTANCES_DIR"/*; do
         if [ -d "$dir" ]; then
             instances+=("$(basename "$dir")")
@@ -388,7 +385,7 @@ start_server() {
         }
     fi
 
-    if is_server_running "ark_$instance"; then
+    if is_server_running "$container_name"; then
         echo -e "${YELLOW}Server for instance $instance is already running.${RESET}"
         return 0
     fi
@@ -397,30 +394,60 @@ start_server() {
 
     echo -e "${CYAN}Starting server for instance: $instance${RESET}"
 
-    # Set cluster parameters if ClusterID is set
-    local cluster_params=""
+    # Set cluster parameters if ClusterID is set.
+    # Built as an array to avoid quoting issues (mirrors ark_instance_manager.sh).
+    local cluster_params=()
     if [ -n "$CLUSTER_ID" ]; then
-        local cluster_dir="$BASE_DIR/clusters/$CLUSTER_ID"
-        mkdir -p "$cluster_dir" || true
-        cluster_params="-ClusterDirOverride=\"$cluster_dir\" -ClusterId=\"$CLUSTER_ID\""
+        # ARK appends "clusters/<ClusterId>/" to -ClusterDirOverride itself,
+        # so the override must be the BASE directory -- matching ark_instance_manager.sh.
+        local cluster_root="$BASE_DIR"
+        mkdir -p "$BASE_DIR/clusters" || true
+        # Wine maps Z: to /, so convert /path/to/base -> Z:\path\to\base
+        local cluster_dir_win="Z:${cluster_root//\//\\}"
+        cluster_params=(-ClusterDirOverride="$cluster_dir_win" -ClusterId="$CLUSTER_ID")
     fi
 
-    # # Ensure configuration files exists
+    # Ensure configuration files exist
     mkdir -p "$config_dir"
     touch "$config_dir/Game.ini" "$config_dir/GameUserSettings.ini"
 
-    # Ensure configuration directory exists and contains necessary files
     if [ ! -f "$config_dir/Game.ini" ] || [ ! -f "$config_dir/GameUserSettings.ini" ]; then
         echo -e "${RED}Configuration files are missing for instance: $instance${RESET}"
         echo -e "${YELLOW}Expected directory: $config_dir${RESET}"
         return 1
     fi
 
+    # Write the launch command to the server log
+    local server_log="$inst_dir/server.log"
+    {
+        echo "=== ark_docker_manager.sh server launch ==="
+        echo "Timestamp:   $(date -Iseconds)"
+        echo "Instance:    $instance"
+        echo "Container:   $container_name"
+        echo "Image:       $IMAGE_NAME"
+        echo "Command:"
+        echo "  $MAP_NAME?listen?SessionName=$SERVER_NAME ?ServerPassword=$SERVER_PASSWORD?RCONEnabled=True?ServerAdminPassword=$ADMIN_PASSWORD?AltSaveDirectoryName=$SAVE_DIR"
+        echo "  $CUSTOM_START_PARAMETERS -WinLiveMaxPlayers=$MAX_PLAYERS -Port=$GAME_PORT -QueryPort=$QUERY_PORT -RCONPort=$RCON_PORT"
+        echo "  -game ${cluster_params[*]} -server -log -mods=$MOD_IDS"
+        echo "=== launch output below ==="
+        echo
+    } > "$server_log"
+
     # Start the server using Docker
-    # Adding a trailing space to the ServerName to avoid conflicts if the ServerName is identical to the instance name.
-    # This ensures the server processes the name correctly, even though the space is invisible to users.
+    # --security-opt seccomp=unconfined is required because umu-launcher's
+    # pressure-vessel (bwrap) calls unshare(CLONE_NEWUSER), which Docker's
+    # default seccomp profile blocks even when kernel.unprivileged_userns_clone=1.
+    # seccomp/apparmor=unconfined: needed for bwrap/pressure-vessel
+    # inside Docker. The container runs as the host user with the docker
+    # group as supplementary so it can write to bind-mounted volumes.
+    local host_uid=$(id -u)
+    local host_gid=$(id -g)
+    local docker_gid=$(getent group docker | cut -d: -f3)
     docker run -d \
-        --user $(id -u):$(id -g) \
+        --security-opt seccomp=unconfined \
+        --security-opt apparmor=unconfined \
+        --user "${host_uid}:${host_gid}" \
+        --group-add "${docker_gid}" \
         --env UMASK=0007 \
         --name "$container_name" \
         -p "${GAME_PORT}:${GAME_PORT}/udp" \
@@ -428,6 +455,7 @@ start_server() {
         -p "${RCON_PORT}:${RCON_PORT}/tcp" \
         -v "$BINARIES_DIR:/ark/binaries" \
         -v "$inst_dir:/ark/instance" \
+        -v "$BASE_DIR/umu-data:/tmp/umu-home" \
         -v "$config_dir/Game.ini:/ark/binaries/ShooterGame/Saved/Config/WindowsServer/Game.ini:rw" \
         -v "$config_dir/GameUserSettings.ini:/ark/binaries/ShooterGame/Saved/Config/WindowsServer/GameUserSettings.ini:rw" \
         "$IMAGE_NAME" run \
@@ -438,17 +466,72 @@ start_server() {
             -QueryPort=$QUERY_PORT \
             -RCONPort=$RCON_PORT \
             -game \
-            $cluster_params \
+            "${cluster_params[@]}" \
             -server \
             -log \
-            -mods="$MOD_IDS"
+            -mods="$MOD_IDS" \
+        >> "$server_log" 2>&1
 
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}Server started for instance: $instance. It should be fully operational in approximately 60 seconds.${RESET}"
-    else
-        echo -e "${RED}Failed to start the server for instance: $instance.${RESET}"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Failed to start container for instance: $instance.${RESET}"
         return 1
     fi
+
+    # Health check: verify the ARK server process actually booted inside
+    # the container. ARK on Wine needs ~10-20s before ArkAscendedServer.exe
+    # is visible in the process tree. We wait up to 30s for the process
+    # to appear, then another 15s to confirm it stays alive.
+    echo -e "${CYAN}Container started. Verifying server boot...${RESET}"
+
+    local found=0
+    local waited=0
+    while [ "$waited" -lt 30 ]; do
+        if ! docker ps --filter "name=${container_name}" --format "{{.Names}}" | grep -qw "${container_name}"; then
+            # Container exited
+            break
+        fi
+        if docker exec "$container_name" pgrep -f "ArkAscendedServer.exe" >/dev/null 2>&1; then
+            found=1
+            break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+
+    if [ "$found" -ne 1 ]; then
+        echo -e "${RED}ArkAscendedServer.exe did not appear within 30 seconds.${RESET}"
+        echo -e "${YELLOW}--- last 30 lines of container logs ---${RESET}"
+        docker logs --tail 30 "$container_name" 2>/dev/null || echo "(logs not available)"
+        echo -e "${YELLOW}--- last 30 lines of $server_log ---${RESET}"
+        tail -n 30 "$server_log" 2>/dev/null || echo "(server.log not readable)"
+        echo -e "${RED}Server failed to start. Check 'docker logs $container_name' for details.${RESET}"
+        return 1
+    fi
+
+    # Process appeared. Watch for ~15s more to make sure it survives early
+    # engine init (the "PrimalGameData then silent exit" failure mode).
+    local stable_waited=0
+    while [ "$stable_waited" -lt 15 ]; do
+        if ! docker ps --filter "name=${container_name}" --format "{{.Names}}" | grep -qw "${container_name}"; then
+            echo -e "${RED}Container exited during engine init after ${stable_waited}s.${RESET}"
+            echo -e "${YELLOW}--- last 40 lines of container logs ---${RESET}"
+            docker logs --tail 40 "$container_name" 2>/dev/null
+            echo -e "${RED}Server crashed during boot.${RESET}"
+            return 1
+        fi
+        if ! docker exec "$container_name" pgrep -f "ArkAscendedServer.exe" >/dev/null 2>&1; then
+            echo -e "${RED}ArkAscendedServer.exe exited during engine init after ${stable_waited}s.${RESET}"
+            echo -e "${YELLOW}--- last 40 lines of container logs ---${RESET}"
+            docker logs --tail 40 "$container_name" 2>/dev/null
+            echo -e "${RED}Server crashed during boot.${RESET}"
+            return 1
+        fi
+        sleep 3
+        stable_waited=$((stable_waited + 3))
+    done
+
+    echo -e "${GREEN}Server for instance '$instance' is running (took ${waited}s to spawn, stable for ${stable_waited}s).${RESET}"
+    echo -e "${GREEN}Full boot to playable state usually takes 30-90 seconds more (map load).${RESET}"
 }
 
 # Function to stop the server
@@ -460,10 +543,41 @@ stop_server() {
         return 0
     fi
 
-    echo -e "${GREEN}Stopping instance '$instance' ...${RESET}"
-    send_rcon_command ${instance} "SaveWorld"
-    docker stop "ark_${instance}" 2>/dev/null || true
-    docker rm "ark_${instance}" 2>/dev/null || true
+    load_instance_config "$instance" || return 1
+
+    echo -e "${GREEN}Attempting graceful shutdown for instance $instance...${RESET}"
+
+    # Send SaveWorld first, then DoExit
+    send_rcon_command "$instance" "SaveWorld" >/dev/null 2>&1 || true
+
+    local response
+    response=$(send_rcon_command "$instance" "DoExit" 2>&1) || true
+
+    if [[ "$response" == "Exiting..." ]]; then
+        echo -e "${GREEN}Server instance $instance reported 'Exiting...'. Awaiting shutdown (can take up to 2 minutes)...${RESET}"
+
+        local timeout=120
+        local waited=0
+
+        while is_server_running "ark_$instance"; do
+            sleep 2
+            waited=$((waited + 2))
+            if [ $waited -ge $timeout ]; then
+                echo -e "${RED}Server $instance didn't shut down within $timeout seconds. Forcing kill...${RESET}"
+                docker rm -f "ark_${instance}" 2>/dev/null || true
+                return 0
+            fi
+        done
+
+        echo -e "${GREEN}Server for instance $instance has shut down gracefully.${RESET}"
+        docker rm "ark_${instance}" 2>/dev/null || true
+        return 0
+    else
+        echo -e "${RED}Graceful shutdown failed or timed out. Forcing shutdown.${RESET}"
+        docker rm -f "ark_${instance}" 2>/dev/null || true
+        echo -e "${GREEN}Server for instance $instance has been forcefully stopped.${RESET}"
+        return 0
+    fi
 }
 
 # Function to start RCON CLI
@@ -479,7 +593,6 @@ start_rcon_cli() {
 
     echo -e "${CYAN}Starting RCON CLI for instance: $instance${RESET}"
 
-    # Use the new RCON-Client
     docker exec -it "ark_$instance" python3 /opt/rcon/rcon.py \
         "localhost:$RCON_PORT" \
         -p "$ADMIN_PASSWORD" || {
@@ -523,20 +636,14 @@ change_mods() {
 # Function to check server status
 check_server_status() {
     local instance="$1"
-
-    # Check if an instance was provided
     if [[ -z "$instance" ]]; then
         echo -e "${RED}Error: No instance specified.${RESET}"
         return 1
     fi
-
-    # Load instance configuration
     if ! load_instance_config "$instance"; then
         echo -e "${RED}Error loading configuration for instance $instance.${RESET}"
         return 1
     fi
-
-    # Check Docker status
     if docker ps --filter "name=ark_${instance}" --format "{{.Names}}" | grep -qw "ark_${instance}"; then
         echo -e "${GREEN}Server for instance $instance is running.${RESET}"
     else
@@ -550,18 +657,13 @@ start_all_instances() {
     for instance in "$INSTANCES_DIR"/*; do
         if [ -d "$instance" ]; then
             instance_name=$(basename "$instance")
-
-            # Check if the server is already running
             if is_server_running "ark_$instance_name"; then
                 echo -e "${YELLOW}Instance $instance_name is already running. Skipping...${RESET}"
                 continue
             fi
-
-            # Attempt to start the server
             if start_server "$instance_name"; then
-                # Only wait if the server started successfully
-                echo -e "${YELLOW}Waiting 5 seconds before starting the next instance...${RESET}"
-                sleep 5
+                echo -e "${YELLOW}Waiting 30 seconds before starting the next instance...${RESET}"
+                sleep 30
             else
                 echo -e "${RED}Server $instance_name could not be started due to conflicts or errors. Skipping wait time.${RESET}"
             fi
@@ -598,36 +700,47 @@ send_rcon_command() {
 
     load_instance_config "$instance" || return 1
 
-    # Always use the silent mode of the RCON client
     local response
     response=$(docker exec -i "ark_$instance" python3 /opt/rcon/rcon.py \
-    "localhost:$RCON_PORT" \
-    -p "$ADMIN_PASSWORD" \
-    -c "$command" \
-    --silent 2>&1)
+        "localhost:$RCON_PORT" \
+        -p "$ADMIN_PASSWORD" \
+        -c "$command" \
+        --silent 2>&1)
 
-    # Check if the RCON command was successful
     if [ $? -ne 0 ]; then
         echo -e "${RED}Failed to send RCON command to instance $instance.${RESET}"
         return 1
     fi
 
-    # Return the RCON response
     echo "$response"
     return 0
 }
 
 # Function to show running instances
 show_running_instances() {
-    echo -e "${CYAN}Running instances (containers):${RESET}"
-    docker ps --filter "name=ark_" --format "{{.Names}}"
+    echo -e "${CYAN}Checking running instances...${RESET}"
+    local running_count=0
+    for instance in "$INSTANCES_DIR"/*; do
+        if [ -d "$instance" ]; then
+            instance_name=$(basename "$instance")
+            if docker ps --filter "name=ark_${instance_name}" --format "{{.Names}}" | grep -qw "ark_${instance_name}"; then
+                echo -e "${GREEN}$instance_name is running${RESET}"
+                ((running_count++)) || true
+            else
+                echo -e "${RED}$instance_name is not running${RESET}"
+            fi
+        fi
+    done
+    if [ $running_count -eq 0 ]; then
+        echo -e "${RED}No instances are currently running.${RESET}"
+    else
+        echo -e "${GREEN}Total running instances: $running_count${RESET}"
+    fi
 }
 
 # Function to delete an instance
 delete_instance() {
     local instance="$1"
-
-   # Select instance if none was provided
     if [[ -z "$instance" ]]; then
         if ! select_instance; then
             return
@@ -635,31 +748,24 @@ delete_instance() {
         instance="$selected_instance"
     fi
 
-    # Check if the instance exists
     if [[ -d "$INSTANCES_DIR/$instance" ]]; then
         echo -e "${RED}Warning: This will permanently delete the instance '$instance' and all its data.${RESET}"
         echo "Type CONFIRM to delete the instance '$instance', or cancel to abort"
         read -p "> " response
 
         if [[ $response == "CONFIRM" ]]; then
-            # Verify if the Docker container is running, and stop it
             if docker ps --filter "name=ark_${instance}" --format "{{.Names}}" | grep -qw "ark_${instance}"; then
                 echo -e "${CYAN}Stopping instance '$instance'...${RESET}"
                 stop_server "$instance"
             fi
-
-            # Remove the Docker container
             if docker ps -a --filter "name=ark_${instance}" --format "{{.Names}}" | grep -qw "ark_${instance}"; then
                 echo -e "${CYAN}Removing Docker container for instance '$instance'...${RESET}"
                 docker rm "ark_${instance}" > /dev/null 2>&1 || echo -e "${RED}Failed to remove Docker container.${RESET}"
             fi
-
-            # Delete the instance directory
             echo -e "${CYAN}Deleting instance directory for '$instance'...${RESET}"
             rm -rf "$INSTANCES_DIR/$instance" || echo -e "${RED}Failed to delete instance directory.${RESET}"
             rm -rf "$BINARIES_DIR/ShooterGame/Saved/$instance" || true
             rm -rf "$BINARIES_DIR/ShooterGame/Saved/SavedArks/$instance" || true
-
             echo -e "${GREEN}Instance '$instance' has been deleted.${RESET}"
         elif [[ $response == "cancel" ]]; then
             echo -e "${YELLOW}Deletion cancelled.${RESET}"
@@ -671,7 +777,6 @@ delete_instance() {
     fi
 }
 
-
 # Function to change instance name
 change_instance_name() {
     local instance=$1
@@ -680,7 +785,6 @@ change_instance_name() {
     echo -e "${CYAN}Enter the new name for instance '$instance' (or type 'cancel' to abort):${RESET}"
     read -r new_instance_name
 
-    # Validation
     if [ "$new_instance_name" = "cancel" ]; then
         echo -e "${YELLOW}Instance renaming cancelled.${RESET}"
         return
@@ -692,19 +796,16 @@ change_instance_name() {
         return 1
     fi
 
-    # Stop the server if running
     if is_server_running "ark_$instance"; then
         echo -e "${CYAN}Stopping running server for instance '$instance' before renaming...${RESET}"
         stop_server "$instance"
     fi
 
-    # Rename instance directory
     mv "$INSTANCES_DIR/$instance" "$INSTANCES_DIR/$new_instance_name" || {
         echo -e "${RED}Failed to rename instance directory.${RESET}"
         return 1
     }
 
-    # Rename save directories if they exist
     if [ -d "$BINARIES_DIR/ShooterGame/Saved/$instance" ]; then
         mv "$BINARIES_DIR/ShooterGame/Saved/$instance" "$BINARIES_DIR/ShooterGame/Saved/$new_instance_name" || true
     fi
@@ -713,18 +814,16 @@ change_instance_name() {
         mv "$BINARIES_DIR/ShooterGame/Saved/SavedArks/$instance" "$BINARIES_DIR/ShooterGame/Saved/SavedArks/$new_instance_name" || true
     fi
 
-    # Update SaveDir in the instance configuration
     sed -i "s/^SaveDir=.*/SaveDir=$new_instance_name/" "$INSTANCES_DIR/$new_instance_name/instance_config.ini"
 
     echo -e "${GREEN}Instance renamed from '$instance' to '$new_instance_name'.${RESET}"
 }
 
-# Function to edit GameUserSettins.ini
+# Function to edit GameUserSettings.ini
 edit_gameusersettings() {
     local instance=$1
     local file_path="$INSTANCES_DIR/$instance/Config/GameUserSettings.ini"
 
-    #Check if server is running
     if is_server_running "ark_$instance"; then
         echo -e "${YELLOW}Server for instance $instance is running. Stop it to edit config${RESET}"
         return 0
@@ -741,7 +840,6 @@ edit_game_ini() {
     local instance=$1
     local file_path="$INSTANCES_DIR/$instance/Config/Game.ini"
 
-    #Check if server is running
     if is_server_running "ark_$instance"; then
         echo -e "${YELLOW}Server for instance $instance is running. Stop it to edit config${RESET}"
         return 0
@@ -769,16 +867,14 @@ menu_restore_world() {
     fi
 }
 
-#Save a world's backup from an instance
+# Save a world's backup from an instance
 backup_instance_world() {
     local instance=$1
-    # Check if the server is running
     if is_server_running "ark_$instance"; then
         echo -e "${RED}The server for instance '$instance' is running. Stop it before creating a backup.${RESET}"
         return 0
     fi
 
-    # -- List all world folders in $BINARIES_DIR/ShooterGame/Saved/$instance --
     local worlds=()
     local instance_dir="$BINARIES_DIR/ShooterGame/Saved/$instance"
     if [ ! -d "$instance_dir" ]; then
@@ -786,7 +882,6 @@ backup_instance_world() {
         return 1
     fi
 
-    # Collect folders typical for ARK worlds (e.g., TheIsland_WP, Ragnarok_WP, etc.)
     for d in "$instance_dir"/*; do
         [ -d "$d" ] && worlds+=("$(basename "$d")")
     done
@@ -809,7 +904,6 @@ backup_instance_world() {
             continue
         fi
 
-        # Create backup directory
         local backups_dir="$BASE_DIR/backups"
         mkdir -p "$backups_dir"
 
@@ -827,10 +921,9 @@ backup_instance_world() {
     done
 }
 
-#Load an existing backup (from the backups folder) into a target instance
+# Load an existing backup into a target instance
 restore_backup_to_instance() {
     local target_instance=$1
-    # Check if the server is running
     if is_server_running "ark_$target_instance"; then
         echo -e "${RED}The server for instance '$target_instance' is running. Stop it before restoring a backup.${RESET}"
         return 1
@@ -844,7 +937,6 @@ restore_backup_to_instance() {
     fi
     set -e
 
-    # Gather all *.tar.gz files in $backups_dir
     local backup_files=()
     while IFS= read -r -d $'\0' file; do
         backup_files+=("$file")
@@ -869,7 +961,6 @@ restore_backup_to_instance() {
             continue
         fi
 
-        # WARNING about overwriting
         echo -e "${RED}WARNING: Restoring this backup may overwrite existing worlds.${RESET}"
         echo -e "Type '${YELLOW}CONFIRM${RESET}' to proceed, or '${YELLOW}cancel${RESET}' to abort:"
         read -r user_input
@@ -878,7 +969,6 @@ restore_backup_to_instance() {
             return 0
         fi
 
-        # Extract the backup into $BINARIES_DIR/ShooterGame/Saved/$target_instance/
         mkdir -p "$BINARIES_DIR/ShooterGame/Saved/$target_instance"
         echo -e "${CYAN}Extracting backup...${RESET}"
         tar -xzf "$backup_file" -C "$BINARIES_DIR/ShooterGame/Saved/$target_instance/"
@@ -888,16 +978,15 @@ restore_backup_to_instance() {
         else
             echo -e "${RED}Error extracting the backup.${RESET}"
         fi
-
         break
     done
 }
-##Save a world's backup from an instance via CLI
+
+# Save a world's backup from an instance via CLI
 backup_instance_world_cli() {
     local instance=$1
     local world_folder=$2
 
-    # Check if the server is running
     if is_server_running "ark_$instance"; then
         echo -e "${RED}The server for instance '$instance' is running. Please stop it first.${RESET}"
         return 1
@@ -932,12 +1021,9 @@ backup_instance_world_cli() {
     fi
 }
 
-
-#Function to select editor and open a file in editor
+# Function to select editor and open a file in editor
 select_editor() {
-local file_path="$1"
-
-# Open the file in the default text editor
+    local file_path="$1"
     if [ -n "$EDITOR" ]; then
         "$EDITOR" "$file_path"
     elif command -v nano >/dev/null 2>&1; then
@@ -983,6 +1069,7 @@ edit_configuration_menu() {
         esac
     done
 }
+
 # Function to configure the restart_manager.sh
 configure_companion_script() {
     local companion_script="$BASE_DIR/ark_restart_manager.sh"
@@ -992,14 +1079,12 @@ configure_companion_script() {
     fi
     echo -e "${CYAN}-- Restart Manager Configuration --${RESET}"
 
-    # 1) Dynamically get all available instances
     get_available_instances
     if [ ${#available_instances[@]} -eq 0 ]; then
         echo -e "${RED}No instances found in '$INSTANCES_DIR'. Returning to main menu.${RESET}"
         return 0
     fi
 
-    # Show them to the user
     echo -e "${CYAN}Available instances:${RESET}"
     local i
     for i in "${!available_instances[@]}"; do
@@ -1010,7 +1095,6 @@ configure_companion_script() {
 
     local selected_instances=()
 
-    # 2) Parse user selection
     if [[ "$user_input" == "all" ]]; then
         selected_instances=("${available_instances[@]}")
     else
@@ -1030,11 +1114,9 @@ configure_companion_script() {
         return 1
     fi
 
-    # 3) Ask for announcement times
     echo -e "${CYAN}Enter announcement times in seconds (space-separated), e.g. '1800 1200 600 180 10':${RESET}"
     read -r -a user_times
 
-    # 4) Ask for corresponding announcement messages
     echo -e "${CYAN}Please enter one announcement message for each time above.${RESET}"
     user_messages=()
     for time in "${user_times[@]}"; do
@@ -1043,7 +1125,6 @@ configure_companion_script() {
         user_messages+=( "$msg" )
     done
 
-    # Build the config block
     local instances_str=""
     for inst in "${selected_instances[@]}"; do
         instances_str+="\"$inst\" "
@@ -1061,7 +1142,7 @@ configure_companion_script() {
 
     local new_config_block="# --------------------------------------------- CONFIGURATION STARTS HERE --------------------------------------------- #
 
-# Define your server instances here (use the names you use in ark_instance_manager.sh)
+# Define your server instances here (use the names you use in ark_docker_manager.sh)
 instances=($instances_str)
 
 # Define the exact announcement times in seconds
@@ -1073,10 +1154,8 @@ $messages_str)
 
 # --------------------------------------------- CONFIGURATION ENDS HERE --------------------------------------------- #"
 
-    # Backup companion script
     cp "$companion_script" "$companion_script.bak"
 
-    # Replace old config block with new one via awk
     awk -v new_conf="$new_config_block" '
         BEGIN { skip=0 }
         /# --------------------------------------------- CONFIGURATION STARTS HERE --------------------------------------------- #/ {
@@ -1093,7 +1172,6 @@ $messages_str)
 
     echo -e "${GREEN}Restart Manager script has been updated successfully.${RESET}"
 
-    # 5) Ask for cron job
     echo -e "${CYAN}Would you like to schedule a daily cron job for server restart? [y/N]${RESET}"
     read -r add_cron
     if [[ "$add_cron" =~ ^[Yy]$ ]]; then
@@ -1103,47 +1181,43 @@ $messages_str)
         local cron_hour=$(echo "$cron_time" | cut -d':' -f1)
         local cron_min=$(echo "$cron_time" | cut -d':' -f2)
 
-        # 1) Read the current crontab (if any),
-        # 2) Remove all lines referencing our manager script,
-        # 3) Append a new line with the chosen schedule,
-        # 4) Save back to crontab
-        ( crontab -l 2>/dev/null | grep -v "$companion_script"
-        echo "$cron_min $cron_hour * * * $companion_script"
-        ) | crontab -
-
-        echo -e "${GREEN}Cron job scheduled daily at $cron_time.${RESET}"
+        local tmp_cron
+        tmp_cron=$(mktemp)
+        crontab -l 2>/dev/null | grep -v "$companion_script" > "$tmp_cron" || true
+        echo "$cron_min $cron_hour * * * $companion_script" >> "$tmp_cron"
+        if crontab "$tmp_cron"; then
+            echo -e "${GREEN}Cron job successfully scheduled for $cron_time daily.${RESET}"
+        else
+            echo -e "${RED}Error: Failed to install crontab.${RESET}"
+        fi
+        rm -f "$tmp_cron"
     fi
 }
 
 setup_host_directory() {
-    # 1) Create directories (including subdirectory 'Saved')
-    mkdir -p "$BINARIES_DIR/ShooterGame/Saved"
+    mkdir -p "$BINARIES_DIR/ShooterGame/Saved" "$BASE_DIR/umu-data"
 
-    # 2) (Optional) Set ownership
-    chown -R root:$(whoami) "$BINARIES_DIR" 2>/dev/null || true
+    # SETGID only on directories (files don't need it). The ! -perm check
+    # skips already-correct dirs, saving time on the ~30 GB ARK tree.
+    find "$BINARIES_DIR" "$BASE_DIR/umu-data" -type d ! -perm -2070         -exec chmod 2770 {} + 2>/dev/null || true
 
-    # 3) Set base permissions with Set-GID bit for the entire tree
-    chmod -R 2770 "$BINARIES_DIR" 2>/dev/null || true
+    # Group write on everything so both the update container and the server
+    # container can write regardless of who owns the file.
+    find "$BINARIES_DIR" "$BASE_DIR/umu-data" ! -perm -0060         -exec chmod g+rwX {} + 2>/dev/null || true
 
-    # 4) Completely remove existing ACLs (recursively)
+    # Clean up any ACLs that might override Unix permissions
     setfacl -bR "$BINARIES_DIR" 2>/dev/null || true
-
-    # 5) Set new ACLs for existing files/directories
-    setfacl -R -m u::rwx,g::rwx,o::--- "$BINARIES_DIR" 2>/dev/null || true
-
-    # 6) Set default ACLs for FUTURE files/directories
-    setfacl -R -m d:u::rwx,d:g::rwx,d:o::--- "$BINARIES_DIR" 2>/dev/null || true
+    setfacl -bR "$BASE_DIR/umu-data" 2>/dev/null || true
 }
-
-
-
 
 # Update ARK server binaries
 update_ark_binaries() {
     setup_host_directory
-    echo -e "${YELLOW}=== Updating ARK Server Files===${RESET}"
-    # Start a temporary container that runs in "update" mode
+    echo -e "${YELLOW}=== Updating ARK Server Files ===${RESET}"
+    local host_uid=$(id -u)
+    local host_gid=$(id -g)
     docker run --rm \
+      --user "${host_uid}:${host_gid}" \
       -v "$BINARIES_DIR:/ark/binaries" \
       --env UMASK=0007 \
       "$IMAGE_NAME" update
@@ -1153,7 +1227,7 @@ update_ark_binaries() {
 # Main menu using 'select'
 main_menu() {
     while true; do
-        echo -e "${YELLOW}ARK Server Instance Management${RESET}"
+        echo -e "${YELLOW}ARK Server Instance Management (Docker)${RESET}"
         echo
 
         options=(
@@ -1169,7 +1243,7 @@ main_menu() {
             "Show Running Instances"                           # 10
             "Backup a World from Instance"                     # 11
             "Load Backup to Instance"                          # 12
-            "Configure Restart Manager "                       # 13
+            "Configure Restart Manager"                        # 13
             "Exit ARK Server Manager"                          # 14
         )
 
@@ -1304,7 +1378,7 @@ manage_instance() {
                     ;;
                 9)
                     change_instance_name "$instance"
-                    instance=$new_instance_name  # Update the instance variable
+                    instance=$new_instance_name
                     break
                     ;;
                 10)
@@ -1364,10 +1438,10 @@ else
                     ;;
                 send_rcon)
                     if [ $# -lt 3 ]; then
-                        echo -e "${RED}Usage: $0 <instance_name> send_rcon \"<rcon_command>\"${RESET}"
+                        echo -e "${RED}Usage: $0 <instance_name> send_rcon "<rcon_command>"${RESET}"
                         exit 1
                     fi
-                    rcon_command="${@:3}"  # Get all arguments from the third onwards
+                    rcon_command="${@:3}"
                     send_rcon_command "$instance_name" "$rcon_command"
                     ;;
                 backup)
@@ -1380,7 +1454,7 @@ else
                     ;;
                 *)
                     echo -e "${RED}Usage: $0 [install|update|setup|start_all|stop_all|show_running|delete <instance_name>]${RESET}"
-                    echo -e "${RED}       $0 <instance_name> [start|stop|restart|send_rcon \"<rcon_command>\" |backup <world_folder>]${RESET}"
+                    echo -e "${RED}       $0 <instance_name> [start|stop|restart|send_rcon "<rcon_command>" |backup <world_folder>]${RESET}"
                     echo "Or run without arguments to enter interactive mode."
                     exit 1
                     ;;
