@@ -70,9 +70,8 @@ If you prefer the flexibility and modularity of Docker, the **`ark_docker_manage
 
 2. **Make scripts executable**:
    ```bash
-   chmod +x ark_instance_manager.sh ark_restart_manager.sh rcon.py
+   chmod +x ark_instance_manager.sh ark_restart_manager.sh rcon.py ark_docker_manager.sh
    ```
-   *(If using Docker, also `chmod +x ark_docker_manager.sh`.)*
 
 3. **Run `ark_instance_manager.sh` (no arguments)**:
    ```bash
