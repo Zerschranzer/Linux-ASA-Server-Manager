@@ -233,8 +233,37 @@ check_dependencies() {
     fi
 }
 
+# Ubuntu 23.10+ (and derivatives) restrict unprivileged user namespace creation
+# via AppArmor (kernel.apparmor_restrict_unprivileged_userns=1). The Steam Linux
+# Runtime container is built by pressure-vessel's *bundled* bwrap binary, which
+# lives under ~/.local/share/umu/ -- a path no shipped AppArmor profile covers.
+# Result: every umu/Proton launch dies with
+#   "bwrap: setting up uid map: Permission denied".
+# A per-binary AppArmor profile is impractical here (the bwrap path changes with
+# runtime updates), so the supported fix is the sysctl below, which restores the
+# upstream kernel default that Arch/Fedora/Debian use anyway. Arch and most
+# other distros are unaffected (the sysctl does not exist there -> check is a
+# silent no-op).
+check_userns_restriction() {
+    local restricted
+    restricted="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" || return 0
+    if [ "$restricted" = "1" ]; then
+        echo -e "${RED}Error: this system restricts unprivileged user namespaces (Ubuntu AppArmor hardening).${RESET}"
+        echo -e "${YELLOW}The Steam Linux Runtime container cannot start under this restriction; server${RESET}"
+        echo -e "${YELLOW}launches will fail with 'bwrap: setting up uid map: Permission denied'.${RESET}"
+        echo
+        echo -e "${CYAN}Fix (apply now + persist across reboots):${RESET}"
+        echo "    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+        echo "    echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | sudo tee /etc/sysctl.d/99-umu-userns.conf"
+        echo
+        echo -e "${CYAN}Then re-run this script. (This restores the upstream kernel default used by Arch, Fedora and Debian.)${RESET}"
+        exit 1
+    fi
+}
+
 # Check dependencies before proceeding
 check_dependencies
+check_userns_restriction
 
 # Function to check if required scripts are executable
 check_executables() {
@@ -897,11 +926,28 @@ start_server() {
     mkdir -p "$save_dir" || true
 
     # Set cluster parameters if ClusterID is set
-    local cluster_params=""
+    local cluster_params=()
     if [ -n "$CLUSTER_ID" ]; then
-        local cluster_dir="$BASE_DIR/clusters/$CLUSTER_ID"
-        mkdir -p "$cluster_dir" || true
-        cluster_params="-ClusterDirOverride=\"$cluster_dir\" -ClusterId=\"$CLUSTER_ID\""
+        # ARK appends "clusters/<ClusterId>/" to -ClusterDirOverride by itself,
+        # so the override must be the manager's BASE directory -- NOT
+        # $BASE_DIR/clusters (yields clusters/clusters/<id>/) and NOT
+        # $BASE_DIR/clusters/<id> (yields clusters/<id>/clusters/<id>/).
+        # Verified against issue #31: override Z:\...\lasasm\clusters produced
+        # ~/lasasm/clusters/clusters/deers. Final on-disk location is therefore
+        # $BASE_DIR/clusters/<ClusterId>/.
+        local cluster_root="$BASE_DIR"
+        mkdir -p "$BASE_DIR/clusters" || true
+        # ArkAscendedServer.exe is a Windows binary: it needs a Windows path.
+        # A raw unix path has no drive letter, so UE treats it as *relative*
+        # and resolves it against the CWD -- producing duplicated paths like
+        # /home/user/home/user/... and, worse, *different* cluster dirs for
+        # instances launched from different CWDs (breaks character transfer).
+        # Wine maps Z: to /, so convert /path/to/clusters -> Z:\path\to\clusters.
+        local cluster_dir_win="Z:${cluster_root//\//\\}"
+        # Built as an array, expanded quoted at the call site -- the previous
+        # string-with-embedded-escaped-quotes construction passed literal
+        # quote characters into the exe's argv.
+        cluster_params=(-ClusterDirOverride="$cluster_dir_win" -ClusterId="$CLUSTER_ID")
     fi
 
     # Start the server using the loaded configuration variables
@@ -927,7 +973,7 @@ start_server() {
         echo "    \"$MAP_NAME?listen?SessionName=$SERVER_NAME ?ServerPassword=$SERVER_PASSWORD?RCONEnabled=True?ServerAdminPassword=$ADMIN_PASSWORD?AltSaveDirectoryName=$SAVE_DIR\" \\"
         echo "    $CUSTOM_START_PARAMETERS \\"
         echo "    -WinLiveMaxPlayers=$MAX_PLAYERS -Port=$GAME_PORT -QueryPort=$QUERY_PORT -RCONPort=$RCON_PORT \\"
-        echo "    -game $cluster_params -server -log -mods=\"$MOD_IDS\""
+        echo "    -game ${cluster_params[*]} -server -log -mods=\"$MOD_IDS\""
         echo "=== launch output below ==="
         echo
     } > "$server_log"
@@ -956,7 +1002,7 @@ start_server() {
     -QueryPort=$QUERY_PORT \
     -RCONPort=$RCON_PORT \
     -game \
-    $cluster_params \
+    "${cluster_params[@]}" \
     -server \
     -log \
     -mods="$MOD_IDS" \
