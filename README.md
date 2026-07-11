@@ -176,9 +176,44 @@ Each instance lives in `instances/<instance_name>` with its own configs and logs
 
 ### 5.4 Clustering
 
-1. Set a **shared `ClusterID`** in each instance’s `instance_config.ini`.  
-2. The script automatically creates a cluster directory and links them.  
+1. Set a **shared `ClusterID`** in each instance's `instance_config.ini`.
+2. The script automatically creates the cluster directory and links the instances.
 3. Players can transfer characters/dinos/items between these servers in-game.
+
+**Where cluster data is stored:** All cross-server transfer data (uploaded
+characters, items, dinos) for a cluster lives in:
+
+```
+<manager root>/clusters/<ClusterID>/
+```
+
+e.g. `~/Linux-ASA-Server-Manager/clusters/mycluster/`. All instances sharing
+the same `ClusterID` read and write this same directory, regardless of the
+working directory the script was launched from. Include this directory in
+your backups if you want to preserve uploaded characters and items.
+
+#### Migrating cluster data from older versions
+
+Older versions passed a broken path to the server executable, which caused
+cluster data to end up in one of these locations instead:
+
+- a duplicated path such as
+  `/home/<user>/home/<user>/.../clusters/<id>/clusters/<id>/`
+  (the exact path could even differ depending on the directory the script was
+  launched from), or
+- `<manager root>/clusters/clusters/<ClusterID>/` (early test branch of the fix)
+
+To keep existing uploaded characters and items, move the **contents** of the
+old directory into the new location **once, while all servers are stopped**:
+
+```bash
+mv <old path>/* <manager root>/clusters/<ClusterID>/
+rm -rf <old, now empty parent dirs>
+```
+
+If you skip this step, transfers will appear empty after updating. The data is
+**not lost** -- it is still sitting in the old directory and can be moved at
+any time.
 
 ---
 
@@ -287,6 +322,18 @@ Or send a single command:
 
 * **System Resources**:
   ASA needs a lot of RAM and CPU. Keep an eye on usage, especially when running multiple instances.
+
+* **Ubuntu 23.10 or newer: `bwrap: setting up uid map: Permission denied`**
+  Ubuntu restricts unprivileged user namespaces via AppArmor, which prevents
+  the Steam Linux Runtime container from starting. The script detects this and
+  refuses to run until the restriction is lifted:
+
+  ```bash
+  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+  echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | sudo tee /etc/sysctl.d/99-umu-userns.conf
+  ```
+
+  This restores the upstream kernel default that Arch, Fedora and Debian use.
 
 * **Running inside a virtual machine?**
   Make sure the VM's CPU type is set to `host`. The server needs **SSE4.2** support, which the default `kvm64` CPU does not provide.
