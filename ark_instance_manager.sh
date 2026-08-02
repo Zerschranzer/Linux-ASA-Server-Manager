@@ -41,7 +41,16 @@ SERVER_FILES_DIR="$BASE_DIR/server-files"
 # It is downloaded standalone into $BASE_DIR/umu-launcher (same pattern as the old
 # Proton tarball download), so the script does not depend on any distro package
 # for umu-launcher itself. Only python3 >= 3.10 is required on the host.
-UMU_VERSION="1.4.0"
+#
+# MINIMUM 1.4.3. Around 2026-07-24 Valve's CDN stopped serving the directory-style
+# runtime endpoint (repo.steampowered.com/<variant>/images/latest-public-beta/),
+# which umu <= 1.4.2 requests directly -- those versions now die with
+# "HTTPError: repo.steampowered.com returned the status: 403" while fetching the
+# Steam Linux Runtime. umu 1.4.3+ resolves the concrete version via
+# latest-public-beta.txt first (upstream PR #703, "use cdn-friendly version file
+# url") and works again. Bumping this variable is enough: the install block below
+# tracks the installed version in a marker file and re-downloads on mismatch.
+UMU_VERSION="1.4.4"
 UMU_DIR="$BASE_DIR/umu-launcher"
 UMU_RUN_BIN="$UMU_DIR/umu-run"
 UMU_URL="https://github.com/Open-Wine-Components/umu-launcher/releases/download/$UMU_VERSION/umu-launcher-$UMU_VERSION-zipapp.tar"
@@ -432,23 +441,50 @@ install_base_server() {
         echo -e "${GREEN}SteamCMD already installed.${RESET}"
     fi
 
-    # Download and unpack umu-launcher zipapp if not already installed.
+    # Download and unpack umu-launcher zipapp if not installed or outdated.
     # The zipapp is a single self-contained Python archive that works on any
     # distribution with python3 >= 3.10 -- no distro packages needed.
     # umu-launcher itself downloads and manages the Steam Linux Runtime and
     # GE-Proton on first run (when PROTONPATH=GE-Proton is set).
-    if [ ! -x "$UMU_RUN_BIN" ]; then
-        echo -e "${CYAN}Downloading umu-launcher zipapp ($UMU_VERSION)...${RESET}"
+    #
+    # A marker file records which zipapp version is installed. On mismatch (or
+    # if the marker is missing -- i.e. the install predates this mechanism,
+    # which includes every 1.4.0 install broken by the Valve CDN change) the
+    # directory is wiped and re-downloaded, so existing installs pick up
+    # version bumps automatically instead of staying on a broken build forever.
+    local umu_version_marker="$UMU_DIR/.installed-version"
+    local umu_installed_version=""
+    [ -f "$umu_version_marker" ] && umu_installed_version="$(cat "$umu_version_marker" 2>/dev/null)"
+    if [ ! -x "$UMU_RUN_BIN" ] || [ "$umu_installed_version" != "$UMU_VERSION" ]; then
+        if [ -x "$UMU_RUN_BIN" ]; then
+            echo -e "${YELLOW}umu-launcher ${umu_installed_version:-of unknown version} is installed, but $UMU_VERSION is required.${RESET}"
+            echo -e "${CYAN}Replacing it with the $UMU_VERSION zipapp...${RESET}"
+        else
+            echo -e "${CYAN}Downloading umu-launcher zipapp ($UMU_VERSION)...${RESET}"
+        fi
+        # Wipe the directory to avoid stale files from a previous zipapp layout.
+        rm -rf "$UMU_DIR"
         mkdir -p "$UMU_DIR"
         local umu_tar="$UMU_DIR/umu-launcher-$UMU_VERSION-zipapp.tar"
-        wget -q -O "$umu_tar" "$UMU_URL"
+        if ! wget -q -O "$umu_tar" "$UMU_URL"; then
+            rm -f "$umu_tar"
+            echo -e "${RED}Error: failed to download umu-launcher $UMU_VERSION from:${RESET}"
+            echo -e "${YELLOW}  $UMU_URL${RESET}"
+            echo -e "${CYAN}Check your network connection, or whether the release still exists.${RESET}"
+            exit 1
+        fi
         # The tar contains an `umu/` directory; we extract its contents into UMU_DIR.
-        tar -xf "$umu_tar" -C "$UMU_DIR" --strip-components=1
+        if ! tar -xf "$umu_tar" -C "$UMU_DIR" --strip-components=1; then
+            rm -f "$umu_tar"
+            echo -e "${RED}Error: extraction of the umu-launcher zipapp failed (corrupt download?).${RESET}"
+            exit 1
+        fi
         rm "$umu_tar"
         chmod +x "$UMU_RUN_BIN"
-        echo -e "${GREEN}umu-launcher installed at $UMU_DIR.${RESET}"
+        echo "$UMU_VERSION" > "$umu_version_marker"
+        echo -e "${GREEN}umu-launcher $UMU_VERSION installed at $UMU_DIR.${RESET}"
     else
-        echo -e "${GREEN}umu-launcher already installed.${RESET}"
+        echo -e "${GREEN}umu-launcher $UMU_VERSION already installed.${RESET}"
     fi
 
     # Download the pinned GE-Proton build if not already present. We fetch it
@@ -531,8 +567,23 @@ install_base_server() {
     esac
     local prefix_ready=1
     [ -f "$UMU_PREFIX_DIR/system.reg" ] && [ -d "$UMU_PREFIX_DIR/drive_c/windows/system32" ] || prefix_ready=0
+    # A runtime counts as installed only if toolmanifest.vdf AND a platform
+    # directory exist. Checking toolmanifest.vdf alone is not enough: a
+    # partially-downloaded runtime (e.g. aborted by the 2026-07 CDN 403) can
+    # leave toolmanifest.vdf behind while umu's own validation fails with
+    # "Could not find sniper_platform_* in .../steamrt3". Mirroring umu's
+    # check here prevents this script from reporting a broken runtime as ready.
+    _umu_runtime_installed() {
+        compgen -G "$umu_share/$required_runtime_glob/toolmanifest.vdf" >/dev/null 2>&1 || return 1
+        case "$required_runtime_glob" in
+            steamrt3) compgen -G "$umu_share/steamrt3/sniper_platform_*" >/dev/null 2>&1 || return 1 ;;
+        esac
+        return 0
+    }
+    # if-form on purpose: under `set -e`, a bare `_umu_runtime_installed &&
+    # runtime_ready=1` would abort the script whenever the runtime is missing.
     local runtime_ready=0
-    if compgen -G "$umu_share/$required_runtime_glob/toolmanifest.vdf" >/dev/null 2>&1; then
+    if _umu_runtime_installed; then
         runtime_ready=1
     fi
 
@@ -551,10 +602,17 @@ install_base_server() {
         # with updates disabled umu would not pull the missing one. All regular
         # server starts keep UMU_RUNTIME_UPDATE=0 -- by then the runtime is
         # guaranteed present.
+        # Output goes to a log file instead of /dev/null: when the runtime
+        # download fails (network error, Valve CDN change, ...) the log is the
+        # only place the actual cause is visible. The exit code of wineboot is
+        # still ignored on purpose -- wineboot returning non-zero on an
+        # otherwise fine prefix is common -- success is decided by the
+        # filesystem checks below, not by the exit code.
+        local warmup_log="$BASE_DIR/umu-warmup.log"
         WINEPREFIX="$UMU_PREFIX_DIR" \
         GAMEID="$UMU_GAMEID" \
         PROTONPATH="$UMU_PROTONPATH" \
-            "$UMU_RUN_BIN" wineboot --init >/dev/null 2>&1 || true
+            "$UMU_RUN_BIN" wineboot --init >"$warmup_log" 2>&1 || true
         # wineserver may not be on PATH (umu's wine binary is sandboxed), so we
         # poll until no wineserver instance is holding the prefix, with a
         # fixed-timeout fallback to avoid hanging forever.
@@ -566,6 +624,25 @@ install_base_server() {
             sleep 2
             waited=$((waited + 2))
         done
+        # Verify the warm-up actually delivered. Previously the script printed
+        # "ready" unconditionally here, so a failed runtime download surfaced
+        # only much later, during the initial ARK config-generation start --
+        # with a misleading green message in between.
+        if ! _umu_runtime_installed; then
+            echo -e "${RED}Error: the Steam Linux Runtime ($required_runtime_glob) was not installed.${RESET}"
+            echo -e "${YELLOW}umu output (last lines of $warmup_log):${RESET}"
+            tail -n 15 "$warmup_log"
+            echo -e "${CYAN}Common causes: no network connectivity to repo.steampowered.com, or an${RESET}"
+            echo -e "${CYAN}outdated umu-launcher (versions <= 1.4.2 fail with HTTP 403 since 2026-07).${RESET}"
+            echo -e "${CYAN}Re-run 'Install/Update Base Server' -- it re-downloads umu on version bumps.${RESET}"
+            exit 1
+        fi
+        if [ ! -f "$UMU_PREFIX_DIR/system.reg" ] || [ ! -d "$UMU_PREFIX_DIR/drive_c/windows/system32" ]; then
+            echo -e "${RED}Error: the Wine prefix at $UMU_PREFIX_DIR was not initialized.${RESET}"
+            echo -e "${YELLOW}umu output (last lines of $warmup_log):${RESET}"
+            tail -n 15 "$warmup_log"
+            exit 1
+        fi
         echo -e "${GREEN}umu runtime and Wine prefix ready.${RESET}"
     fi
 
