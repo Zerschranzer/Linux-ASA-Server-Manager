@@ -5,10 +5,10 @@
 # --------------------------------------------- CONFIGURATION STARTS HERE --------------------------------------------- #
 
 # Define your server instances here (use the names you use in ark_instance_manager.sh)
-instances=("instanceexample1" "instanceexample2" )
+instances=("instanceexample1" "instanceexample2")
 
 # Define the exact announcement times in seconds
-announcement_times=(1800 1200 600 180 10 )
+announcement_times=(1800 1200 600 180 10)
 
 # Corresponding messages for each announcement time
 announcement_messages=(
